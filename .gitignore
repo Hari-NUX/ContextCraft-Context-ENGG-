@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.svelte-kit/
+src-tauri/target/
+backend/.venv/
+backend/__pycache__/
+**/__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+data/*
+!data/.gitkeep
+*.sqlite
+*.db
+*.pdf
+*.docx
