@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .svelte-kit/
+.vite/
 src-tauri/target/
 backend/.venv/
 backend/__pycache__/
@@ -15,3 +16,4 @@ data/*
 *.db
 *.pdf
 *.docx
+*.log
