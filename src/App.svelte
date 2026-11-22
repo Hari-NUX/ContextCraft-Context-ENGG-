@@ -1,10 +1,14 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { listen } from "@tauri-apps/api/event";
   import ChatView from "./lib/components/ChatView.svelte";
   import ContextView from "./lib/components/ContextView.svelte";
   import ExperimentView from "./lib/components/ExperimentView.svelte";
-  import { getOllamaStatus } from "./lib/services/ollama";
+  import AnalyticsView from "./lib/components/AnalyticsView.svelte";
+  import PromptGeneratorView from "./lib/components/PromptGeneratorView.svelte";
+  import { getOllamaStatus, listDocuments, pullOllamaModel as pullModelRequest } from "./lib/services/ollama";
   import type { ConnectionState, OllamaModel, OllamaStatus } from "./lib/types/ollama";
+  import type { DocumentMetadata } from "./lib/types/chat";
 
   let baseUrl = $state("http://localhost:11434");
   let connection = $state<ConnectionState>("checking");
@@ -12,14 +16,84 @@
   let errorMessage = $state("");
   let isRefreshing = $state(false);
   let lastChecked = $state<Date | null>(null);
-  let currentPage = $state<"dashboard" | "playground" | "context">("dashboard");
+  let libraryDocuments = $state<DocumentMetadata[]>([]);
+  let currentPage = $state<"dashboard" | "playground" | "context" | "analytics" | "prompt">("dashboard");
   let playgroundTab = $state<"chat" | "experiments">("chat");
+  let modelNameToPull = $state("");
+  let activePullId = $state("");
+  let pullProgress = $state<{ status: string; total?: number; completed?: number; done: boolean } | null>(null);
+  let pullNotice = $state("");
+  let isPullingModel = $state(false);
+  let pullPercent = $derived(pullProgress?.done ? 100 : pullProgress?.total ? Math.min(100, Math.round(((pullProgress.completed ?? 0) / pullProgress.total) * 100)) : 0);
+  const connected = $derived(connection === "connected");
 
   const runningNames = $derived(new Set(status?.runningModels ?? []));
 
   onMount(() => {
+    let disposed = false;
+    let stopPullListener: (() => void) | undefined;
     void refreshStatus();
+    void refreshLibrary();
+    void listen<{ requestId: string; status: string; total?: number; completed?: number; done: boolean }>("ollama-pull-progress", (event) => {
+      if (event.payload.requestId !== activePullId) return;
+      pullProgress = event.payload;
+      if (event.payload.done) pullNotice = `Installed ${modelNameToPull.trim()}. Refreshing your local model list…`;
+    }).then((stop) => { if (disposed) stop(); else stopPullListener = stop; });
+    const onLibraryUpdate = () => { void refreshLibrary(); };
+    const onRequestFilePicker = () => openFilePicker();
+    const onRequestOpenDocument = (event: Event) => {
+      const id = (event as CustomEvent<{ id?: string }>).detail?.id;
+      if (id) openLibraryDocument(id);
+    };
+    window.addEventListener("contextcraft:documents-updated", onLibraryUpdate);
+    window.addEventListener("contextcraft:request-file-picker", onRequestFilePicker);
+    window.addEventListener("contextcraft:request-open-document", onRequestOpenDocument);
+    return () => {
+      disposed = true;
+      stopPullListener?.();
+      window.removeEventListener("contextcraft:documents-updated", onLibraryUpdate);
+      window.removeEventListener("contextcraft:request-file-picker", onRequestFilePicker);
+      window.removeEventListener("contextcraft:request-open-document", onRequestOpenDocument);
+    };
   });
+
+  async function pullModel(event: SubmitEvent) {
+    event.preventDefault();
+    const requestedName = modelNameToPull.trim();
+    if (!requestedName || !connected || isPullingModel) return;
+    activePullId = crypto.randomUUID();
+    pullProgress = { status: "Starting model download…", done: false };
+    pullNotice = "";
+    isPullingModel = true;
+    try {
+      await pullModelRequest(activePullId, baseUrl, requestedName);
+      pullProgress = { status: "success", done: true };
+      pullNotice = `Installed ${requestedName}. The refreshed model list is ready.`;
+      modelNameToPull = "";
+      await refreshStatus();
+    } catch (error) {
+      pullProgress = null;
+      pullNotice = error instanceof Error ? error.message : String(error);
+    } finally {
+      isPullingModel = false;
+      activePullId = "";
+    }
+  }
+
+  async function refreshLibrary() {
+    try { libraryDocuments = await listDocuments(); }
+    catch { libraryDocuments = []; }
+  }
+
+  function openFilePicker() {
+    currentPage = "context";
+    window.setTimeout(() => window.dispatchEvent(new Event("contextcraft:open-file-picker")), 80);
+  }
+
+  function openLibraryDocument(id: string) {
+    currentPage = "context";
+    window.setTimeout(() => window.dispatchEvent(new CustomEvent("contextcraft:open-document", { detail: { id } })), 80);
+  }
 
   async function refreshStatus() {
     isRefreshing = true;
@@ -83,8 +157,11 @@
       <button class="nav-item" class:selected={currentPage === "context"} aria-current={currentPage === "context" ? "page" : undefined} onclick={() => (currentPage = "context")} title="Context workspace">
         <span class="nav-icon">▤</span><span class="nav-label">Context</span>
       </button>
-      <button class="nav-item" disabled title="Analytics is coming later">
+      <button class="nav-item" class:selected={currentPage === "analytics"} aria-current={currentPage === "analytics" ? "page" : undefined} onclick={() => (currentPage = "analytics")} title="Analytics">
         <span class="nav-icon">▥</span><span class="nav-label">Analytics</span>
+      </button>
+      <button class="nav-item" class:selected={currentPage === "prompt"} aria-current={currentPage === "prompt" ? "page" : undefined} onclick={() => (currentPage = "prompt")} title="Prompt Generator">
+        <span class="nav-icon">✦</span><span class="nav-label">Prompt</span>
       </button>
     </div>
     <div class="sidebar-bottom">
@@ -97,15 +174,27 @@
     <header class="topbar">
       <div>
         <p class="eyebrow">YOUR AI WORKSPACE</p>
-        <h1>{currentPage === "dashboard" ? "Dashboard" : currentPage === "playground" ? "Playground" : "Context workspace"}</h1>
+        <h1>{currentPage === "dashboard" ? "Dashboard" : currentPage === "playground" ? "Playground" : currentPage === "context" ? "Context workspace" : currentPage === "analytics" ? "Analytics" : "Prompt Generator"}</h1>
       </div>
       <div class="topbar-meta">
+        <details class="global-library-menu">
+          <summary>Files <span>{libraryDocuments.length}</span></summary>
+          <div class="global-library-popover">
+            <p class="eyebrow">LOCAL SOURCE LIBRARY</p>
+            {#if libraryDocuments.length}
+              {#each libraryDocuments as document}
+                <button class="global-library-item" onclick={() => openLibraryDocument(document.id)}><span>{document.name}</span><small>{document.pageCount} pages</small></button>
+              {/each}
+            {:else}<p class="global-library-empty">No files added yet.</p>{/if}
+            <button class="global-library-add" onclick={openFilePicker}>＋ Add a file</button>
+          </div>
+        </details>
         <span class="local-chip"><span class="privacy-dot"></span> Running locally</span>
         <div class="avatar" aria-label="Local workspace">H</div>
       </div>
     </header>
 
-    {#if currentPage === "dashboard"}
+    <div hidden={currentPage !== "dashboard"}>
     <section class="welcome-row">
       <div>
         <p class="eyebrow accent-text">CHECKPOINT 01</p>
@@ -198,34 +287,56 @@
       </article>
     </section>
 
+    <section class="glass-card model-hub-panel" aria-labelledby="model-hub-title">
+      <div class="model-hub-heading">
+        <div><p class="eyebrow accent-text">LOCAL MODEL HUB</p><h3 id="model-hub-title">Manage Ollama models</h3><p class="muted">Pull a model by its Ollama library name. Downloads can be several gigabytes, so they start only when you submit a model name.</p></div>
+        <span class="model-count">{status?.models.length ?? 0}<small>installed</small></span>
+      </div>
+      <form class="model-pull-form" onsubmit={pullModel}>
+        <label for="ollama-pull-name">MODEL NAME</label>
+        <input id="ollama-pull-name" bind:value={modelNameToPull} placeholder="For example: qwen3:0.6b" disabled={!connected || isPullingModel} />
+        <button class="primary-button" type="submit" disabled={!connected || isPullingModel || !modelNameToPull.trim()}>{isPullingModel ? "Downloading…" : "Pull model"}<span>↓</span></button>
+      </form>
+      {#if pullProgress}
+        <div class="model-pull-progress" role="status">
+          <div><strong>{isPullingModel ? pullProgress.status : "Download complete"}</strong>{#if pullProgress.total}<span>{pullPercent}% · {formatSize(pullProgress.completed ?? 0)} / {formatSize(pullProgress.total)}</span>{/if}</div>
+          <progress value={pullPercent} max="100" aria-label="Model download progress"></progress>
+        </div>
+      {/if}
+      {#if pullNotice}<p class="model-pull-notice" class:error-text={!pullProgress?.done && !isPullingModel} role="status">{pullNotice}</p>{/if}
+      <div class="model-hub-list-heading"><strong>Installed on this Ollama server</strong><button class="secondary-button" onclick={refreshStatus} disabled={!connected || isRefreshing}>{isRefreshing ? "Refreshing…" : "Refresh list"}</button></div>
+      {#if status?.models.length}
+        <div class="model-hub-list">{#each status.models as model (model.name)}<article><span class="model-orb">✳</span><div><strong>{model.name}</strong><small>{modelSubtitle(model)} · {formatSize(model.size)}</small></div><span class="running-mark" class:active={runningNames.has(model.name) || runningNames.has(model.model)} title={runningNames.has(model.name) || runningNames.has(model.model) ? "Running" : "Available"}></span></article>{/each}</div>
+      {:else}<p class="model-hub-empty">{connected ? "No models installed yet. Enter an Ollama model name above to pull one." : "Connect to Ollama to manage local models."}</p>{/if}
+    </section>
+
     <section class="lower-grid">
       <article class="glass-card next-card">
         <div class="next-icon">✦</div>
         <div>
-          <p class="eyebrow accent-text">UP NEXT</p>
-          <h3>Controlled prompting experiments</h3>
-          <p class="muted">Next, compare basic prompting, prompt engineering, and context engineering on the same question and model, with retrieved document passages visible.</p>
+          <p class="eyebrow accent-text">NEW WORKSPACE</p>
+          <h3>Prompt generator</h3>
+        <p class="muted">Build copy-ready prompts for another AI tool and get guidance on whether to share a whole document, selected pages, or a focused excerpt.</p>
         </div>
-        <span class="coming-soon">NEXT</span>
+        <button class="coming-soon" onclick={() => (currentPage = "prompt")}>OPEN ↗</button>
       </article>
       <article class="privacy-card">
         <span class="privacy-shield">⬡</span>
-        <div><strong>Local model conversations</strong><p>Chat messages are sent to the configured Ollama address. This checkpoint does not connect to a cloud AI provider.</p></div>
+        <div><strong>Choose your model provider</strong><p>Ollama conversations stay on your configured local server. If you choose a cloud provider in Playground, prompts and selected context are sent to that provider.</p></div>
       </article>
     </section>
-    <footer class="page-footer"><span>ContextCraft</span><span>Local model dashboard · Checkpoint 01</span></footer>
-    {:else if currentPage === "playground"}
+    <footer class="page-footer"><span>ContextCraft</span><span>Local model dashboard</span></footer>
+    </div>
+    <div hidden={currentPage !== "playground"}>
       <div class="workspace-tabs" role="tablist" aria-label="Playground workspaces">
         <button class:active={playgroundTab === "chat"} role="tab" aria-selected={playgroundTab === "chat"} onclick={() => (playgroundTab = "chat")}>Local chat</button>
         <button class:active={playgroundTab === "experiments"} role="tab" aria-selected={playgroundTab === "experiments"} onclick={() => (playgroundTab = "experiments")}>Comparison lab</button>
       </div>
-      {#if playgroundTab === "chat"}
-        <ChatView models={status?.models ?? []} baseUrl={baseUrl} connected={connection === "connected"} />
-      {:else}
-        <ExperimentView models={status?.models ?? []} baseUrl={baseUrl} connected={connection === "connected"} />
-      {/if}
-    {:else}
-      <ContextView models={status?.models ?? []} baseUrl={baseUrl} connected={connection === "connected"} />
-    {/if}
+      <div hidden={playgroundTab !== "chat"}><ChatView models={status?.models ?? []} baseUrl={baseUrl} connected={connection === "connected"} /></div>
+      <div hidden={playgroundTab !== "experiments"}><ExperimentView models={status?.models ?? []} baseUrl={baseUrl} connected={connection === "connected"} /></div>
+    </div>
+    <div hidden={currentPage !== "context"}><ContextView models={status?.models ?? []} baseUrl={baseUrl} connected={connection === "connected"} /></div>
+    <div hidden={currentPage !== "analytics"}><AnalyticsView /></div>
+    <div hidden={currentPage !== "prompt"}><PromptGeneratorView /></div>
   </main>
 </div>

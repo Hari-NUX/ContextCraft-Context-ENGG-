@@ -77,6 +77,169 @@ struct OllamaMessage {
     content: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ProviderMessage {
+    role: String,
+    content: String,
+}
+
+fn provider_key_entry(provider: &str) -> Result<keyring::Entry, String> {
+    if !matches!(provider, "gemini" | "openai" | "anthropic") {
+        return Err("Choose Gemini, OpenAI, or Anthropic.".to_string());
+    }
+    keyring::Entry::new("ContextCraft", &format!("provider-{provider}"))
+        .map_err(|error| format!("Could not access Windows Credential Manager: {error}"))
+}
+
+#[tauri::command]
+fn save_provider_key(provider: String, api_key: String) -> Result<(), String> {
+    let key = api_key.trim();
+    if key.len() < 8 || key.len() > 4096 {
+        return Err("Enter a valid API key.".to_string());
+    }
+    provider_key_entry(&provider)?
+        .set_password(key)
+        .map_err(|error| format!("Could not save the key to Windows Credential Manager: {error}"))
+}
+
+#[tauri::command]
+fn has_provider_key(provider: String) -> Result<bool, String> {
+    match provider_key_entry(&provider)?.get_password() {
+        Ok(_) => Ok(true),
+        Err(keyring::Error::NoEntry) => Ok(false),
+        Err(error) => Err(format!("Could not check Windows Credential Manager: {error}")),
+    }
+}
+
+#[tauri::command]
+fn delete_provider_key(provider: String) -> Result<(), String> {
+    match provider_key_entry(&provider)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(format!("Could not remove the key from Windows Credential Manager: {error}")),
+    }
+}
+
+#[tauri::command]
+async fn list_provider_models(provider: String) -> Result<Vec<String>, String> {
+    let api_key = provider_key_entry(&provider)?.get_password()
+        .map_err(|_| format!("No {provider} API key is saved yet."))?;
+    let client = Client::builder().connect_timeout(Duration::from_secs(15)).timeout(Duration::from_secs(45))
+        .build().map_err(|error| format!("Could not create the provider connection: {error}"))?;
+    let mut request = match provider.as_str() {
+        "gemini" => client.get("https://generativelanguage.googleapis.com/v1beta/models").header("x-goog-api-key", api_key),
+        "openai" => client.get("https://api.openai.com/v1/models").bearer_auth(api_key),
+        "anthropic" => client.get("https://api.anthropic.com/v1/models").header("x-api-key", api_key).header("anthropic-version", "2023-06-01"),
+        _ => return Err("Choose Gemini, OpenAI, or Anthropic.".to_string()),
+    };
+    request = request.header("accept", "application/json");
+    let response = request.send().await.map_err(|_| format!("Could not reach {provider}. Check your internet connection and API key."))?;
+    let status = response.status();
+    let payload: Value = response.json().await.map_err(|_| format!("Could not read the model list returned by {provider}."))?;
+    if !status.is_success() { return Err(provider_error(status, payload.to_string())); }
+    let returned_models: Vec<String> = match provider.as_str() {
+        "gemini" => payload["models"].as_array().into_iter().flatten()
+            .filter(|item| item["supportedGenerationMethods"].as_array().is_some_and(|methods| methods.iter().any(|method| method.as_str() == Some("generateContent"))))
+            .filter_map(|item| item["name"].as_str().map(|name| name.strip_prefix("models/").unwrap_or(name).to_string())).collect(),
+        "openai" => payload["data"].as_array().into_iter().flatten()
+            .filter_map(|item| item["id"].as_str()).filter(|id| id.starts_with("gpt-") || id.starts_with('o') || id.starts_with("chat-")).map(str::to_string).collect(),
+        "anthropic" => payload["data"].as_array().into_iter().flatten().filter_map(|item| item["id"].as_str()).map(str::to_string).collect(),
+        _ => Vec::new(),
+    };
+    let preferred: &[&str] = match provider.as_str() {
+        "gemini" => &["gemini-4-hydrogen", "gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"],
+        "openai" => &["gpt-6.2-sol", "gpt-6-luna", "gpt-6.2-astra"],
+        "anthropic" => &["claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-5-5"],
+        _ => &[],
+    };
+    let mut models: Vec<String> = preferred.iter().filter(|id| returned_models.iter().any(|available| available.as_str() == **id)).map(|id| (*id).to_string()).collect();
+    // Some provider accounts return preview/tooling models that list text generation but reject
+    // multi-turn chat. Offer only our known chat-compatible IDs, with documented choices as a
+    // fallback when the provider's model catalog omits them for this key or region.
+    if models.is_empty() { models = preferred.iter().map(|id| (*id).to_string()).collect(); }
+    Ok(models)
+}
+
+fn provider_error(status: reqwest::StatusCode, detail: String) -> String {
+    format!("Provider request failed with {status}: {detail}")
+}
+
+#[tauri::command]
+async fn stream_provider_chat(
+    app: AppHandle,
+    request_id: String,
+    provider: String,
+    model: String,
+    messages: Vec<ProviderMessage>,
+) -> Result<(), String> {
+    let api_key = provider_key_entry(&provider)?
+        .get_password()
+        .map_err(|_| format!("No {provider} API key is saved. Add one in Provider settings first."))?;
+    if model.trim().is_empty() || messages.is_empty() {
+        return Err("Choose a model and enter a message before sending.".to_string());
+    }
+    let client = Client::builder().connect_timeout(Duration::from_secs(15)).timeout(Duration::from_secs(300))
+        .build().map_err(|error| format!("Could not create the provider connection: {error}"))?;
+    let (url, body) = match provider.as_str() {
+        "gemini" => {
+            if !model.chars().all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')) {
+                return Err("The Gemini model ID contains unsupported characters.".to_string());
+            }
+            let system = messages.iter().filter(|item| item.role == "system").map(|item| item.content.as_str()).collect::<Vec<_>>().join("\n\n");
+            let contents: Vec<Value> = messages.iter().filter(|item| item.role != "system").map(|item| {
+                json!({ "role": if item.role == "assistant" { "model" } else { "user" }, "parts": [{ "text": item.content }] })
+            }).collect();
+            let mut body = json!({ "contents": contents });
+            if !system.is_empty() { body["systemInstruction"] = json!({ "parts": [{ "text": system }] }); }
+            (format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"), body)
+        },
+        "openai" => {
+            let input: Vec<Value> = messages.iter().map(|item| json!({"role": if item.role == "system" { "developer" } else { item.role.as_str() }, "content": item.content})).collect();
+            ("https://api.openai.com/v1/responses".to_string(), json!({"model": model, "input": input}))
+        },
+        "anthropic" => {
+            let system = messages.iter().filter(|item| item.role == "system").map(|item| item.content.as_str()).collect::<Vec<_>>().join("\n\n");
+            let input: Vec<Value> = messages.iter().filter(|item| item.role != "system").map(|item| json!({"role": item.role, "content": item.content})).collect();
+            let mut body = json!({"model": model, "max_tokens": 2048, "messages": input});
+            if !system.is_empty() { body["system"] = json!(system); }
+            ("https://api.anthropic.com/v1/messages".to_string(), body)
+        },
+        _ => return Err("This provider is not supported yet.".to_string()),
+    };
+    let mut request = client.post(url).json(&body);
+    match provider.as_str() {
+        "gemini" => request = request.header("x-goog-api-key", api_key),
+        "openai" => request = request.bearer_auth(api_key),
+        "anthropic" => request = request.header("x-api-key", api_key).header("anthropic-version", "2023-06-01"),
+        _ => {}
+    }
+    let response = request.send().await.map_err(|_| format!("Could not reach {provider}. Check your internet connection and API key."))?;
+    let status = response.status();
+    let payload: Value = response.json().await.map_err(|error| format!("Could not decode {provider}'s response: {error}"))?;
+    if !status.is_success() { return Err(provider_error(status, payload.to_string())); }
+    let answer = match provider.as_str() {
+        "gemini" => payload["candidates"][0]["content"]["parts"].as_array().map(|parts| parts.iter().filter_map(|part| part["text"].as_str()).collect::<Vec<_>>().join("\n")).unwrap_or_default(),
+        "openai" => payload["output"].as_array().map(|items| items.iter().flat_map(|item| item["content"].as_array().into_iter().flatten()).filter_map(|part| part["text"].as_str()).collect::<Vec<_>>().join("\n")).unwrap_or_default(),
+        "anthropic" => payload["content"].as_array().map(|parts| parts.iter().filter_map(|part| part["text"].as_str()).collect::<Vec<_>>().join("\n")).unwrap_or_default(),
+        _ => String::new(),
+    };
+    if answer.trim().is_empty() { return Err(format!("{provider} returned no text. Check model availability and provider response details.")); }
+    let input_tokens = match provider.as_str() {
+        "gemini" => payload["usageMetadata"]["promptTokenCount"].as_u64(),
+        "openai" => payload["usage"]["input_tokens"].as_u64(),
+        "anthropic" => payload["usage"]["input_tokens"].as_u64(),
+        _ => None,
+    };
+    let output_tokens = match provider.as_str() {
+        "gemini" => payload["usageMetadata"]["candidatesTokenCount"].as_u64(),
+        "openai" => payload["usage"]["output_tokens"].as_u64(),
+        "anthropic" => payload["usage"]["output_tokens"].as_u64(),
+        _ => None,
+    };
+    app.emit("chat-stream", ChatStreamEvent { request_id, content: answer, done: true, prompt_eval_count: input_tokens, eval_count: output_tokens, total_duration: None, load_duration: None, prompt_eval_duration: None, eval_duration: None })
+        .map_err(|error| format!("Could not deliver the model response: {error}"))?;
+    Ok(())
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ChatMetrics {
@@ -168,6 +331,39 @@ struct DocumentSearchHit {
     score: f32,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ExperimentMetricEntry {
+    id: String,
+    experiment_id: String,
+    label: String,
+    mode: String,
+    model: String,
+    document_name: String,
+    question: String,
+    created_at: u64,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    total_duration_ns: Option<u64>,
+    load_duration_ns: Option<u64>,
+    eval_duration_ns: Option<u64>,
+    client_duration_ns: Option<u64>,
+    retrieved_chunks: usize,
+    status: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatUsageEntry {
+    message_id: String,
+    session_id: String,
+    title: String,
+    model: String,
+    updated_at: u64,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+}
+
 #[derive(Debug, Deserialize)]
 struct EmbeddingResponse {
     embeddings: Vec<Vec<f32>>,
@@ -186,6 +382,20 @@ struct ChatStreamEvent {
     done: bool,
     prompt_eval_count: Option<u64>,
     eval_count: Option<u64>,
+    total_duration: Option<u64>,
+    load_duration: Option<u64>,
+    prompt_eval_duration: Option<u64>,
+    eval_duration: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct OllamaPullEvent {
+    request_id: String,
+    status: String,
+    total: Option<u64>,
+    completed: Option<u64>,
+    done: bool,
 }
 
 fn current_time_millis() -> u64 {
@@ -258,7 +468,15 @@ fn open_memory_database(app: &AppHandle) -> Result<Connection, String> {
                 content TEXT NOT NULL,
                 embedding BLOB NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_document_vectors_document ON document_vectors(document_id);",
+            CREATE INDEX IF NOT EXISTS idx_document_vectors_document ON document_vectors(document_id);
+            CREATE TABLE IF NOT EXISTS experiment_metrics (
+                id TEXT PRIMARY KEY,
+                experiment_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_experiment_metrics_group ON experiment_metrics(experiment_id);
+            CREATE INDEX IF NOT EXISTS idx_experiment_metrics_created ON experiment_metrics(created_at);",
         )
         .map_err(|error| format!("Could not prepare the local chat vector database: {error}"))?;
     Ok(connection)
@@ -507,11 +725,11 @@ fn save_document(
     pages: Vec<DocumentPage>,
 ) -> Result<DocumentMetadata, String> {
     if pages.is_empty() || pages.len() > 600 {
-        return Err("The PDF must contain between 1 and 600 pages.".to_string());
+        return Err("The document must contain between 1 and 600 pages or text sections.".to_string());
     }
     let total_chars: usize = pages.iter().map(|page| page.text.chars().count()).sum();
     if total_chars > 20_000_000 {
-        return Err("This PDF has too much extracted text for this checkpoint (limit: 20 million characters).".to_string());
+        return Err("This document has too much extracted text for this checkpoint (limit: 20 million characters).".to_string());
     }
     let directory = document_directory(&app, &id)?;
     fs::create_dir_all(&directory)
@@ -522,7 +740,7 @@ fn save_document(
         .and_then(|contents| serde_json::from_str::<StoredDocument>(&contents).ok());
     let metadata = DocumentMetadata {
         id,
-        name: if name.trim().is_empty() { "Untitled PDF".to_string() } else { name.trim().to_string() },
+        name: if name.trim().is_empty() { "Untitled file".to_string() } else { name.trim().to_string() },
         page_count: pages.len(),
         extracted_chars: total_chars,
         created_at: previous.map(|document| document.metadata.created_at).unwrap_or(now),
@@ -763,6 +981,105 @@ async fn search_document_chunks(
 }
 
 #[tauri::command]
+fn save_experiment_metrics(
+    app: AppHandle,
+    entries: Vec<ExperimentMetricEntry>,
+) -> Result<usize, String> {
+    if entries.is_empty() || entries.len() > 3 {
+        return Err("An experiment must contain between 1 and 3 result records.".to_string());
+    }
+    let experiment_id = &entries[0].experiment_id;
+    if entries.iter().any(|entry| &entry.experiment_id != experiment_id) {
+        return Err("All saved comparison results must belong to the same experiment.".to_string());
+    }
+    let mut connection = open_memory_database(&app)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("Could not start saving comparison metrics: {error}"))?;
+    for entry in &entries {
+        let payload = serde_json::to_string(entry)
+            .map_err(|error| format!("Could not encode comparison metrics: {error}"))?;
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO experiment_metrics(id, experiment_id, created_at, payload) VALUES (?1, ?2, ?3, ?4)",
+                params![entry.id, entry.experiment_id, entry.created_at as i64, payload],
+            )
+            .map_err(|error| format!("Could not save comparison metrics: {error}"))?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("Could not finish saving comparison metrics: {error}"))?;
+    Ok(entries.len())
+}
+
+#[tauri::command]
+fn list_experiment_metrics(
+    app: AppHandle,
+    limit: Option<usize>,
+) -> Result<Vec<ExperimentMetricEntry>, String> {
+    let connection = open_memory_database(&app)?;
+    let mut statement = connection
+        .prepare("SELECT payload FROM experiment_metrics ORDER BY created_at DESC LIMIT ?1")
+        .map_err(|error| format!("Could not prepare comparison history: {error}"))?;
+    let rows = statement
+        .query_map([limit.unwrap_or(300).clamp(1, 1000) as i64], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("Could not read comparison history: {error}"))?;
+    let mut entries = Vec::new();
+    for row in rows {
+        let payload = row.map_err(|error| format!("Could not read a comparison record: {error}"))?;
+        entries.push(
+            serde_json::from_str::<ExperimentMetricEntry>(&payload)
+                .map_err(|error| format!("Could not decode a comparison record: {error}"))?,
+        );
+    }
+    Ok(entries)
+}
+
+#[tauri::command]
+fn delete_experiment_group(app: AppHandle, experiment_id: String) -> Result<(), String> {
+    let connection = open_memory_database(&app)?;
+    connection
+        .execute("DELETE FROM experiment_metrics WHERE experiment_id = ?1", [&experiment_id])
+        .map_err(|error| format!("Could not delete this comparison: {error}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn clear_experiment_metrics(app: AppHandle) -> Result<(), String> {
+    let connection = open_memory_database(&app)?;
+    connection
+        .execute("DELETE FROM experiment_metrics", [])
+        .map_err(|error| format!("Could not clear comparison history: {error}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn list_chat_usage_metrics(app: AppHandle) -> Result<Vec<ChatUsageEntry>, String> {
+    let sessions = list_chat_sessions(app.clone())?;
+    let mut entries = Vec::new();
+    for session in sessions {
+        let loaded = load_chat_session(app.clone(), session.id.clone())?;
+        for message in loaded.messages {
+            if message.role != "assistant" || message.content.trim().is_empty() {
+                continue;
+            }
+            entries.push(ChatUsageEntry {
+                message_id: message.id,
+                session_id: session.id.clone(),
+                title: session.title.clone(),
+                model: message.model.unwrap_or_else(|| session.model.clone()),
+                updated_at: session.updated_at,
+                input_tokens: message.metrics.as_ref().and_then(|metrics| metrics.input_tokens),
+                output_tokens: message.metrics.as_ref().and_then(|metrics| metrics.output_tokens),
+            });
+        }
+    }
+    entries.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    entries.truncate(500);
+    Ok(entries)
+}
+
+#[tauri::command]
 async fn search_chat_memories(
     app: AppHandle,
     base_url: String,
@@ -880,6 +1197,10 @@ fn emit_chat_line(app: &AppHandle, request_id: &str, line: &[u8]) -> Result<bool
     let done = payload.get("done").and_then(Value::as_bool).unwrap_or(false);
     let prompt_eval_count = payload.get("prompt_eval_count").and_then(Value::as_u64);
     let eval_count = payload.get("eval_count").and_then(Value::as_u64);
+    let total_duration = payload.get("total_duration").and_then(Value::as_u64);
+    let load_duration = payload.get("load_duration").and_then(Value::as_u64);
+    let prompt_eval_duration = payload.get("prompt_eval_duration").and_then(Value::as_u64);
+    let eval_duration = payload.get("eval_duration").and_then(Value::as_u64);
 
     app.emit(
         "chat-stream",
@@ -889,6 +1210,10 @@ fn emit_chat_line(app: &AppHandle, request_id: &str, line: &[u8]) -> Result<bool
             done,
             prompt_eval_count,
             eval_count,
+            total_duration,
+            load_duration,
+            prompt_eval_duration,
+            eval_duration,
         },
     )
     .map_err(|error| format!("Could not deliver the model response to ContextCraft: {error}"))?;
@@ -970,12 +1295,67 @@ async fn stream_chat(
     Ok(())
 }
 
+fn emit_pull_line(app: &AppHandle, request_id: &str, line: &[u8]) -> Result<bool, String> {
+    let payload: Value = serde_json::from_slice(line).map_err(|error| format!("Could not read Ollama's model download progress: {error}"))?;
+    if let Some(error) = payload.get("error").and_then(Value::as_str) { return Err(format!("Ollama could not pull this model: {error}")); }
+    let status = payload.get("status").and_then(Value::as_str).unwrap_or("Downloading model").to_string();
+    let done = status.eq_ignore_ascii_case("success");
+    app.emit("ollama-pull-progress", OllamaPullEvent {
+        request_id: request_id.to_string(),
+        status,
+        total: payload.get("total").and_then(Value::as_u64),
+        completed: payload.get("completed").and_then(Value::as_u64),
+        done,
+    }).map_err(|error| format!("Could not update model download progress: {error}"))?;
+    Ok(done)
+}
+
+#[tauri::command]
+async fn pull_ollama_model(app: AppHandle, request_id: String, base_url: String, model: String) -> Result<(), String> {
+    let normalized = base_url.trim().trim_end_matches('/');
+    let parsed = reqwest::Url::parse(normalized).map_err(|_| "Enter a valid Ollama URL, such as http://localhost:11434".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") { return Err("Ollama URL must use http:// or https://".to_string()); }
+    let model = model.trim();
+    if model.is_empty() || model.len() > 160 || !model.chars().all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | ':' | '/')) || model.contains("..") || model.contains("//") {
+        return Err("Enter a valid Ollama model name, such as qwen3:0.6b.".to_string());
+    }
+    let client = Client::builder().connect_timeout(Duration::from_secs(10)).timeout(Duration::from_secs(14_400)).build()
+        .map_err(|error| format!("Could not create the Ollama connection: {error}"))?;
+    let mut response = client.post(format!("{normalized}/api/pull")).json(&json!({"model": model, "stream": true})).send().await
+        .map_err(|error| format!("Could not start the Ollama model download: {error}"))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let detail = response.text().await.unwrap_or_default();
+        return Err(format!("Ollama model pull failed with {status}: {detail}"));
+    }
+    let mut buffer = Vec::new();
+    let mut completed = false;
+    while let Some(chunk) = response.chunk().await.map_err(|error| format!("Ollama model download was interrupted: {error}"))? {
+        buffer.extend_from_slice(&chunk);
+        while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+            let mut line: Vec<u8> = buffer.drain(..=newline).collect();
+            line.pop();
+            if line.last() == Some(&b'\r') { line.pop(); }
+            if !line.is_empty() { completed = emit_pull_line(&app, &request_id, &line)?; }
+        }
+    }
+    if !buffer.is_empty() { completed = emit_pull_line(&app, &request_id, &buffer)?; }
+    if !completed { return Err("Ollama closed the download stream before reporting success.".to_string()); }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             get_ollama_status,
             stream_chat,
+            pull_ollama_model,
+            stream_provider_chat,
+            save_provider_key,
+            has_provider_key,
+            delete_provider_key,
+            list_provider_models,
             list_chat_sessions,
             create_chat_session,
             load_chat_session,
@@ -990,7 +1370,12 @@ pub fn run() {
             delete_document,
             index_document_chunks,
             get_document_index_count,
-            search_document_chunks
+            search_document_chunks,
+            save_experiment_metrics,
+            list_experiment_metrics,
+            delete_experiment_group,
+            clear_experiment_metrics,
+            list_chat_usage_metrics
         ])
         .run(tauri::generate_context!())
         .expect("error while running ContextCraft");

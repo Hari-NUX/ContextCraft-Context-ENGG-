@@ -1,9 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { ChatMessage, ChatMessageInput, ChatSession, DocumentChunkInput, DocumentIndexResult, DocumentMetadata, DocumentPage, DocumentSearchHit, HistoryIndexResult, HistorySearchHit, LoadedChatSession, StoredDocument } from "../types/chat";
 import type { OllamaStatus } from "../types/ollama";
+import type { ChatUsageEntry, ExperimentMetricEntry } from "../types/analytics";
 
 export function getOllamaStatus(baseUrl: string): Promise<OllamaStatus> {
   return invoke<OllamaStatus>("get_ollama_status", { baseUrl });
+}
+
+export function pullOllamaModel(requestId: string, baseUrl: string, model: string): Promise<void> {
+  return invoke("pull_ollama_model", { requestId, baseUrl, model });
 }
 
 export function streamOllamaChat(
@@ -13,6 +18,26 @@ export function streamOllamaChat(
   messages: ChatMessageInput[],
 ): Promise<void> {
   return invoke("stream_chat", { requestId, baseUrl, model, messages });
+}
+
+export function streamProviderChat(requestId: string, provider: string, model: string, messages: ChatMessageInput[]): Promise<void> {
+  return invoke("stream_provider_chat", { requestId, provider, model, messages });
+}
+
+export function saveProviderKey(provider: string, apiKey: string): Promise<void> {
+  return invoke("save_provider_key", { provider, apiKey });
+}
+
+export function hasProviderKey(provider: string): Promise<boolean> {
+  return invoke<boolean>("has_provider_key", { provider });
+}
+
+export function deleteProviderKey(provider: string): Promise<void> {
+  return invoke("delete_provider_key", { provider });
+}
+
+export function listProviderModels(provider: string): Promise<string[]> {
+  return invoke<string[]>("list_provider_models", { provider });
 }
 
 export function listChatSessions(): Promise<ChatSession[]> {
@@ -93,4 +118,24 @@ export function searchDocumentChunks(
   limit = 5,
 ): Promise<DocumentSearchHit[]> {
   return invoke("search_document_chunks", { baseUrl, documentId, query, limit });
+}
+
+export function saveExperimentMetrics(entries: ExperimentMetricEntry[]): Promise<number> {
+  return invoke("save_experiment_metrics", { entries });
+}
+
+export function listExperimentMetrics(limit = 300): Promise<ExperimentMetricEntry[]> {
+  return invoke("list_experiment_metrics", { limit });
+}
+
+export function deleteExperimentGroup(experimentId: string): Promise<void> {
+  return invoke("delete_experiment_group", { experimentId });
+}
+
+export function clearExperimentMetrics(): Promise<void> {
+  return invoke("clear_experiment_metrics");
+}
+
+export function listChatUsageMetrics(): Promise<ChatUsageEntry[]> {
+  return invoke("list_chat_usage_metrics");
 }
