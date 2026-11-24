@@ -1,12 +1,40 @@
 use reqwest::Client;
 use rusqlite::{params, Connection};
+use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::sync::watch;
+
+#[derive(Default)]
+struct ChatCancellation(Arc<Mutex<HashMap<String, watch::Sender<bool>>>>);
+
+struct CancelRegistration(Arc<Mutex<HashMap<String, watch::Sender<bool>>>>, String);
+
+impl CancelRegistration {
+    fn new(state: &ChatCancellation, request_id: &str) -> (watch::Receiver<bool>, Self) {
+        let (sender, receiver) = watch::channel(false);
+        state.0.lock().expect("chat cancellation registry poisoned").insert(request_id.to_string(), sender);
+        (receiver, Self(state.0.clone(), request_id.to_string()))
+    }
+}
+
+impl Drop for CancelRegistration {
+    fn drop(&mut self) { if let Ok(mut active) = self.0.lock() { active.remove(&self.1); } }
+}
+
+#[tauri::command]
+fn cancel_chat_generation(request_id: String, state: State<'_, ChatCancellation>) -> Result<(), String> {
+    let active = state.0.lock().map_err(|_| "Could not access the active generation.".to_string())?;
+    if let Some(sender) = active.get(&request_id) { let _ = sender.send(true); }
+    Ok(())
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -83,6 +111,104 @@ struct ProviderMessage {
     content: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebSearchResult {
+    title: String,
+    url: String,
+    snippet: String,
+}
+
+#[tauri::command]
+async fn search_web(query: String) -> Result<Vec<WebSearchResult>, String> {
+    let query = query.trim();
+    if query.len() < 2 || query.len() > 500 { return Err("Enter a web search query between 2 and 500 characters.".to_string()); }
+    let search_query = compact_search_query(query);
+    let client = Client::builder().connect_timeout(Duration::from_secs(12)).timeout(Duration::from_secs(25))
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36 ContextCraft/0.1")
+        .build().map_err(|error| format!("Could not prepare web search: {error}"))?;
+    let duck_html = if let Ok(response) = client.get("https://html.duckduckgo.com/html/").query(&[("q", search_query.as_str())]).send().await {
+        if response.status().is_success() { response.text().await.ok() } else { None }
+    } else { None };
+    if let Some(html) = duck_html {
+        let results = filter_relevant_results(query, parse_web_results(&html, false));
+        if !results.is_empty() { return Ok(results); }
+    }
+    let response = client.get("https://www.bing.com/search").query(&[("q", search_query.as_str())]).send().await
+        .map_err(|_| "DuckDuckGo returned no results and Bing could not be reached. Check your internet connection.".to_string())?;
+    let status = response.status();
+    if !status.is_success() { return Err(format!("Web search providers returned {status}.")); }
+    let html = response.text().await.map_err(|_| "Could not read web search results.".to_string())?;
+    let results = filter_relevant_results(query, parse_web_results(&html, true));
+    if results.is_empty() { return Err("Search providers returned no results that clearly match your query. Try a shorter, more specific search.".to_string()); }
+    Ok(results)
+}
+
+fn compact_search_query(query: &str) -> String {
+    let conversational = [
+        "hey", "hello", "please", "can", "could", "you", "u", "search", "internet", "web", "online", "look",
+        "up", "find", "check", "tell", "me", "when", "last", "checked", "it", "was", "like", "so", "how",
+        "is", "are", "now", "ah", "the", "a", "an", "and", "or", "of", "to", "for", "in", "on", "with",
+        "what", "which", "do", "does", "did", "current", "currently", "latest",
+    ];
+    let compacted = query
+        .split_whitespace()
+        .map(|word| word.trim_matches(|character: char| !character.is_alphanumeric() && character != '-' && character != '.' && character != '$'))
+        .filter(|word| {
+            let normalized = word.to_lowercase();
+            !word.is_empty() && !conversational.contains(&normalized.as_str())
+        })
+        .take(12)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if compacted.len() >= 2 { compacted } else { query.to_string() }
+}
+
+fn filter_relevant_results(query: &str, results: Vec<WebSearchResult>) -> Vec<WebSearchResult> {
+    let ignored = [
+        "about", "after", "also", "and", "are", "can", "check", "could", "does", "for", "from", "have",
+        "how", "into", "just", "latest", "many", "much", "now", "please", "search", "should", "tell", "that",
+        "the", "their", "there", "these", "they", "this", "those", "through", "using", "was", "what", "when",
+        "where", "which", "while", "with", "would", "you", "your", "internet", "online", "look", "find",
+        "hey", "cab", "last", "checked", "like", "dollars", "therefore", "here", "just", "into", "from",
+        "the", "for", "but", "not", "all", "any", "its", "it", "to", "of", "so", "ah", "ti",
+    ];
+    let terms: Vec<String> = query
+        .split(|character: char| !character.is_alphanumeric())
+        .map(str::to_lowercase)
+        .filter(|term| !term.is_empty() && (term.len() >= 3 || term.chars().all(|character| character.is_ascii_digit())) && !ignored.contains(&term.as_str()))
+        .collect();
+    if terms.is_empty() { return results; }
+
+    results.into_iter().filter(|result| {
+        let title = result.title.to_lowercase();
+        let snippet = result.snippet.to_lowercase();
+        let title_hits = terms.iter().filter(|term| title.contains(term.as_str())).count();
+        let snippet_hits = terms.iter().filter(|term| snippet.contains(term.as_str())).count();
+        // A matching title term is a useful signal; otherwise require multiple query terms in the snippet.
+        title_hits > 0 || snippet_hits > 1
+    }).collect()
+}
+
+fn parse_web_results(html: &str, bing: bool) -> Vec<WebSearchResult> {
+    let document = Html::parse_document(html);
+    let (links, snippets) = if bing { ("li.b_algo h2 a", "li.b_algo .b_caption p, li.b_algo p") } else { ("a.result__a, a.result-link", ".result__snippet, .result-snippet") };
+    let Ok(link_selector) = Selector::parse(links) else { return Vec::new(); };
+    let Ok(snippet_selector) = Selector::parse(snippets) else { return Vec::new(); };
+    let snippets: Vec<String> = document.select(&snippet_selector).map(|element| element.text().collect::<Vec<_>>().join(" ").split_whitespace().collect::<Vec<_>>().join(" ")).collect();
+    document.select(&link_selector).take(8).enumerate().filter_map(|(index, link)| {
+        let title = link.text().collect::<Vec<_>>().join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
+        let href = link.value().attr("href")?;
+        let mut url = reqwest::Url::parse(href).ok()?;
+        if url.host_str().is_some_and(|host| host.ends_with("duckduckgo.com")) {
+            let target = url.query_pairs().find(|(name, _)| name == "uddg")?.1.into_owned();
+            url = reqwest::Url::parse(&target).ok()?;
+        }
+        if !matches!(url.scheme(), "http" | "https") || title.is_empty() { return None; }
+        Some(WebSearchResult { title, url: url.to_string(), snippet: snippets.get(index).cloned().unwrap_or_default() })
+    }).collect()
+}
+
 fn provider_key_entry(provider: &str) -> Result<keyring::Entry, String> {
     if !matches!(provider, "gemini" | "openai" | "anthropic") {
         return Err("Choose Gemini, OpenAI, or Anthropic.".to_string());
@@ -152,20 +278,29 @@ async fn list_provider_models(provider: String) -> Result<Vec<String>, String> {
         _ => &[],
     };
     let mut models: Vec<String> = preferred.iter().filter(|id| returned_models.iter().any(|available| available.as_str() == **id)).map(|id| (*id).to_string()).collect();
-    // Some provider accounts return preview/tooling models that list text generation but reject
-    // multi-turn chat. Offer only our known chat-compatible IDs, with documented choices as a
-    // fallback when the provider's model catalog omits them for this key or region.
-    if models.is_empty() { models = preferred.iter().map(|id| (*id).to_string()).collect(); }
+    for model_id in returned_models {
+        if !models.contains(&model_id) { models.push(model_id); }
+    }
+    if models.is_empty() {
+        return Err(format!("{provider} did not return any models available for text generation on this API key."));
+    }
     Ok(models)
 }
 
 fn provider_error(status: reqwest::StatusCode, detail: String) -> String {
+    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        return format!("{status} Service Unavailable: {detail}. The provider is temporarily overloaded; this is not an invalid-API-key response. Try again shortly or choose another available model.");
+    }
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return format!("{status} Too Many Requests: {detail}. The provider is rate-limiting requests or the account quota was reached. Check the provider's usage limits and retry later.");
+    }
     format!("Provider request failed with {status}: {detail}")
 }
 
 #[tauri::command]
 async fn stream_provider_chat(
     app: AppHandle,
+    cancellation: State<'_, ChatCancellation>,
     request_id: String,
     provider: String,
     model: String,
@@ -205,16 +340,38 @@ async fn stream_provider_chat(
         },
         _ => return Err("This provider is not supported yet.".to_string()),
     };
-    let mut request = client.post(url).json(&body);
-    match provider.as_str() {
-        "gemini" => request = request.header("x-goog-api-key", api_key),
-        "openai" => request = request.bearer_auth(api_key),
-        "anthropic" => request = request.header("x-api-key", api_key).header("anthropic-version", "2023-06-01"),
-        _ => {}
-    }
-    let response = request.send().await.map_err(|_| format!("Could not reach {provider}. Check your internet connection and API key."))?;
+    let (mut cancel_rx, _registration) = CancelRegistration::new(&cancellation, &request_id);
+    let mut attempt = 0u32;
+    let response = loop {
+        let mut request = client.post(url.clone()).json(&body);
+        match provider.as_str() {
+            "gemini" => request = request.header("x-goog-api-key", api_key.as_str()),
+            "openai" => request = request.bearer_auth(api_key.as_str()),
+            "anthropic" => request = request.header("x-api-key", api_key.as_str()).header("anthropic-version", "2023-06-01"),
+            _ => {}
+        }
+        let response = tokio::select! {
+            changed = cancel_rx.changed() => { if changed.is_ok() && *cancel_rx.borrow() { return Ok(()); } return Err("The request was stopped.".to_string()); },
+            result = request.send() => result.map_err(|_| format!("Could not reach {provider}. Check your internet connection and API key."))?,
+        };
+        let retryable = matches!(response.status().as_u16(), 429 | 500 | 502 | 503 | 504);
+        if retryable && attempt < 2 {
+            drop(response);
+            let delay = Duration::from_millis(700 * 2u64.pow(attempt));
+            attempt += 1;
+            tokio::select! {
+                changed = cancel_rx.changed() => { if changed.is_ok() && *cancel_rx.borrow() { return Ok(()); } },
+                _ = tokio::time::sleep(delay) => {},
+            }
+            continue;
+        }
+        break response;
+    };
     let status = response.status();
-    let payload: Value = response.json().await.map_err(|error| format!("Could not decode {provider}'s response: {error}"))?;
+    let payload: Value = tokio::select! {
+        changed = cancel_rx.changed() => { if changed.is_ok() && *cancel_rx.borrow() { return Ok(()); } return Err("The request was stopped.".to_string()); },
+        result = response.json() => result.map_err(|error| format!("Could not decode {provider}'s response: {error}"))?,
+    };
     if !status.is_success() { return Err(provider_error(status, payload.to_string())); }
     let answer = match provider.as_str() {
         "gemini" => payload["candidates"][0]["content"]["parts"].as_array().map(|parts| parts.iter().filter_map(|part| part["text"].as_str()).collect::<Vec<_>>().join("\n")).unwrap_or_default(),
@@ -222,7 +379,25 @@ async fn stream_provider_chat(
         "anthropic" => payload["content"].as_array().map(|parts| parts.iter().filter_map(|part| part["text"].as_str()).collect::<Vec<_>>().join("\n")).unwrap_or_default(),
         _ => String::new(),
     };
-    if answer.trim().is_empty() { return Err(format!("{provider} returned no text. Check model availability and provider response details.")); }
+    if answer.trim().is_empty() {
+        if provider == "gemini" {
+            let block_reason = payload["promptFeedback"]["blockReason"].as_str();
+            let finish_reason = payload["candidates"][0]["finishReason"].as_str();
+            let detail = if let Some(reason) = block_reason {
+                format!("Gemini blocked the prompt ({reason}). Rephrase the request and try again.")
+            } else if let Some("SAFETY") = finish_reason {
+                "Gemini blocked its response for safety reasons. Rephrase the request and try again.".to_string()
+            } else if let Some("MAX_TOKENS") = finish_reason {
+                "Gemini reached its output limit before returning text. Try a shorter question or a model with a larger output limit.".to_string()
+            } else if let Some(reason) = finish_reason {
+                format!("Gemini returned no text (finish reason: {reason}). Try another model or retry the request.")
+            } else {
+                "Gemini returned no candidate text. Check the selected model and retry.".to_string()
+            };
+            return Err(detail);
+        }
+        return Err(format!("{provider} returned no text. Check model availability and provider response details."));
+    }
     let input_tokens = match provider.as_str() {
         "gemini" => payload["usageMetadata"]["promptTokenCount"].as_u64(),
         "openai" => payload["usage"]["input_tokens"].as_u64(),
@@ -288,6 +463,8 @@ struct HistorySearchHit {
 struct DocumentMetadata {
     id: String,
     name: String,
+    #[serde(default)]
+    folder_path: Option<String>,
     page_count: usize,
     extracted_chars: usize,
     created_at: u64,
@@ -722,6 +899,7 @@ fn save_document(
     app: AppHandle,
     id: String,
     name: String,
+    folder_path: Option<String>,
     pages: Vec<DocumentPage>,
 ) -> Result<DocumentMetadata, String> {
     if pages.is_empty() || pages.len() > 600 {
@@ -741,6 +919,7 @@ fn save_document(
     let metadata = DocumentMetadata {
         id,
         name: if name.trim().is_empty() { "Untitled file".to_string() } else { name.trim().to_string() },
+        folder_path: folder_path.filter(|path| !path.trim().is_empty()),
         page_count: pages.len(),
         extracted_chars: total_chars,
         created_at: previous.map(|document| document.metadata.created_at).unwrap_or(now),
@@ -751,6 +930,34 @@ fn save_document(
         &StoredDocument { metadata: metadata.clone(), pages },
     )?;
     Ok(metadata)
+}
+
+#[tauri::command]
+async fn extract_image_text(base_url: String, model: String, image_base64: String) -> Result<String, String> {
+    let normalized = base_url.trim().trim_end_matches('/');
+    let parsed = reqwest::Url::parse(normalized).map_err(|_| "Enter a valid Ollama URL.".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") { return Err("Ollama URL must use http:// or https://".to_string()); }
+    if model.trim().is_empty() { return Err("Choose an installed vision model to read this image.".to_string()); }
+    if image_base64.len() > 28_000_000 { return Err("Images larger than 20 MB are not supported.".to_string()); }
+    let client = Client::builder().connect_timeout(Duration::from_secs(10)).timeout(Duration::from_secs(180)).build()
+        .map_err(|error| format!("Could not create the local vision connection: {error}"))?;
+    let response = client.post(format!("{normalized}/api/chat")).json(&json!({
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": "Transcribe all readable text in this image faithfully. Preserve headings, lists, tables, and mathematical notation in plain text. If the image has no readable text, describe its useful visual content briefly.",
+            "images": [image_base64]
+        }],
+        "stream": false,
+        "think": false,
+        "options": { "num_ctx": 4096 }
+    })).send().await.map_err(|error| format!("Could not send the image to Ollama: {error}"))?;
+    let status = response.status();
+    let payload: Value = response.json().await.map_err(|error| format!("Could not read Ollama's image response: {error}"))?;
+    if !status.is_success() { return Err(format!("Ollama image extraction failed with {status}: {}", payload["error"].as_str().unwrap_or("unknown error"))); }
+    let text = payload["message"]["content"].as_str().unwrap_or_default().trim();
+    if text.is_empty() { return Err("The local vision model returned no text for this image.".to_string()); }
+    Ok(text.to_string())
 }
 
 #[tauri::command]
@@ -1224,6 +1431,7 @@ fn emit_chat_line(app: &AppHandle, request_id: &str, line: &[u8]) -> Result<bool
 #[tauri::command]
 async fn stream_chat(
     app: AppHandle,
+    cancellation: State<'_, ChatCancellation>,
     request_id: String,
     base_url: String,
     model: String,
@@ -1266,13 +1474,19 @@ async fn stream_chat(
         return Err(format!("Ollama chat request failed with {status}: {detail}"));
     }
 
+    let (mut cancel_rx, _registration) = CancelRegistration::new(&cancellation, &request_id);
     let mut buffer: Vec<u8> = Vec::new();
     let mut completed = false;
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| format!("The Ollama response stream was interrupted: {error}"))?
-    {
+    let mut cancelled = false;
+    loop {
+        let chunk = tokio::select! {
+            changed = cancel_rx.changed() => {
+                if changed.is_ok() && *cancel_rx.borrow() { cancelled = true; break; }
+                continue;
+            },
+            result = response.chunk() => result.map_err(|error| format!("The Ollama response stream was interrupted: {error}"))?,
+        };
+        let Some(chunk) = chunk else { break; };
         buffer.extend_from_slice(&chunk);
         while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
             let mut line: Vec<u8> = buffer.drain(..=newline).collect();
@@ -1289,9 +1503,10 @@ async fn stream_chat(
     if !buffer.is_empty() {
         completed = emit_chat_line(&app, &request_id, &buffer)?;
     }
-    if !completed {
+    if !completed && !cancelled {
         return Err("Ollama closed the response stream before it finished.".to_string());
     }
+    if cancelled { let _ = app.emit("chat-stream", ChatStreamEvent { request_id, content: String::new(), done: true, prompt_eval_count: None, eval_count: None, total_duration: None, load_duration: None, prompt_eval_duration: None, eval_duration: None }); }
     Ok(())
 }
 
@@ -1347,15 +1562,18 @@ async fn pull_ollama_model(app: AppHandle, request_id: String, base_url: String,
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(ChatCancellation::default())
         .invoke_handler(tauri::generate_handler![
             get_ollama_status,
             stream_chat,
+            cancel_chat_generation,
             pull_ollama_model,
             stream_provider_chat,
             save_provider_key,
             has_provider_key,
             delete_provider_key,
             list_provider_models,
+            search_web,
             list_chat_sessions,
             create_chat_session,
             load_chat_session,
@@ -1367,6 +1585,7 @@ pub fn run() {
             list_documents,
             load_document,
             save_document,
+            extract_image_text,
             delete_document,
             index_document_chunks,
             get_document_index_count,

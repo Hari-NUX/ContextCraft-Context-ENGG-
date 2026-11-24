@@ -20,6 +20,10 @@ export function streamOllamaChat(
   return invoke("stream_chat", { requestId, baseUrl, model, messages });
 }
 
+export function cancelChatGeneration(requestId: string): Promise<void> {
+  return invoke("cancel_chat_generation", { requestId });
+}
+
 export function streamProviderChat(requestId: string, provider: string, model: string, messages: ChatMessageInput[]): Promise<void> {
   return invoke("stream_provider_chat", { requestId, provider, model, messages });
 }
@@ -38,6 +42,12 @@ export function deleteProviderKey(provider: string): Promise<void> {
 
 export function listProviderModels(provider: string): Promise<string[]> {
   return invoke<string[]>("list_provider_models", { provider });
+}
+
+export interface WebSearchResult { title: string; url: string; snippet: string; }
+
+export function searchWeb(query: string): Promise<WebSearchResult[]> {
+  return invoke<WebSearchResult[]>("search_web", { query });
 }
 
 export function listChatSessions(): Promise<ChatSession[]> {
@@ -91,8 +101,12 @@ export function loadDocument(id: string): Promise<StoredDocument> {
   return invoke("load_document", { id });
 }
 
-export function saveDocument(id: string, name: string, pages: DocumentPage[]): Promise<DocumentMetadata> {
-  return invoke("save_document", { id, name, pages });
+export function saveDocument(id: string, name: string, pages: DocumentPage[], folderPath?: string): Promise<DocumentMetadata> {
+  return invoke("save_document", { id, name, pages, folderPath: folderPath ?? null });
+}
+
+export function extractImageText(baseUrl: string, model: string, imageBase64: string): Promise<string> {
+  return invoke("extract_image_text", { baseUrl, model, imageBase64 });
 }
 
 export function deleteDocument(id: string): Promise<void> {

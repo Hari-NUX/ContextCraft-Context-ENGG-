@@ -18,7 +18,14 @@
         "minWidth": 760,
         "minHeight": 620,
         "center": true,
-        "resizable": true
+        "resizable": true,
+        "transparent": true,
+        "backgroundColor": [0, 0, 0, 0],
+        "noRedirectionBitmap": true,
+        "windowEffects": {
+          "effects": ["acrylic"],
+          "color": "#6f3c91cc"
+        }
       }
     ],
     "security": {

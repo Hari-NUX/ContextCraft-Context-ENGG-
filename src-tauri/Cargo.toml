@@ -7,7 +7,11 @@ edition = "2021"
 
 [lib]
 name = "contextcraft_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+crate-type = ["rlib"]
+
+[profile.dev]
+debug = 0
+incremental = false
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -19,3 +23,5 @@ tauri = { version = "2", features = [] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 keyring = { version = "4", features = ["v1"] }
+scraper = "0.29"
+tokio = { version = "1", features = ["macros", "sync", "time"] }

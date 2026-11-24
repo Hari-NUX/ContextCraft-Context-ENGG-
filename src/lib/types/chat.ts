@@ -45,6 +45,7 @@ export interface HistoryIndexResult {
 export interface DocumentMetadata {
   id: string;
   name: string;
+  folderPath?: string | null;
   pageCount: number;
   extractedChars: number;
   createdAt: number;

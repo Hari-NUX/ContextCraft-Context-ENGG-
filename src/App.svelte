@@ -1,11 +1,13 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
+import { Effect, getCurrentWindow } from "@tauri-apps/api/window";
   import ChatView from "./lib/components/ChatView.svelte";
   import ContextView from "./lib/components/ContextView.svelte";
   import ExperimentView from "./lib/components/ExperimentView.svelte";
   import AnalyticsView from "./lib/components/AnalyticsView.svelte";
   import PromptGeneratorView from "./lib/components/PromptGeneratorView.svelte";
+  import NotesView from "./lib/components/NotesView.svelte";
   import { getOllamaStatus, listDocuments, pullOllamaModel as pullModelRequest } from "./lib/services/ollama";
   import type { ConnectionState, OllamaModel, OllamaStatus } from "./lib/types/ollama";
   import type { DocumentMetadata } from "./lib/types/chat";
@@ -17,21 +19,71 @@
   let isRefreshing = $state(false);
   let lastChecked = $state<Date | null>(null);
   let libraryDocuments = $state<DocumentMetadata[]>([]);
-  let currentPage = $state<"dashboard" | "playground" | "context" | "analytics" | "prompt">("dashboard");
+  let currentPage = $state<"dashboard" | "playground" | "context" | "notes" | "analytics" | "prompt">("dashboard");
   let playgroundTab = $state<"chat" | "experiments">("chat");
   let modelNameToPull = $state("");
   let activePullId = $state("");
   let pullProgress = $state<{ status: string; total?: number; completed?: number; done: boolean } | null>(null);
   let pullNotice = $state("");
   let isPullingModel = $state(false);
+  let isFileDropActive = $state(false);
+  let selectedAccent = $state("#a457d6");
+  let customAccent = $state("#3978e8");
   let pullPercent = $derived(pullProgress?.done ? 100 : pullProgress?.total ? Math.min(100, Math.round(((pullProgress.completed ?? 0) / pullProgress.total) * 100)) : 0);
   const connected = $derived(connection === "connected");
 
   const runningNames = $derived(new Set(status?.runningModels ?? []));
+  const accentPresets = [
+    { name: "Purple", color: "#a457d6" },
+    { name: "Violet", color: "#7b4ce2" },
+    { name: "Indigo", color: "#5559d8" },
+    { name: "Ocean blue", color: "#287fce" },
+    { name: "Sky blue", color: "#168fce" },
+    { name: "Teal", color: "#159e9a" },
+    { name: "Emerald", color: "#21966a" },
+    { name: "Rose", color: "#d14b83" },
+    { name: "Coral", color: "#d35d55" },
+    { name: "Amber", color: "#bd8128" },
+  ];
+
+  function blendHex(hex: string, target: string, amount: number) {
+    const source = hex.replace("#", "");
+    const destination = target.replace("#", "");
+    const channels = [0, 2, 4].map((offset) => {
+      const from = Number.parseInt(source.slice(offset, offset + 2), 16);
+      const to = Number.parseInt(destination.slice(offset, offset + 2), 16);
+      return Math.round(from + (to - from) * amount).toString(16).padStart(2, "0");
+    });
+    return "#" + channels.join("");
+  }
+
+  function setAccent(color: string, persist = true) {
+    if (!/^#[0-9a-f]{6}$/i.test(color)) return;
+    selectedAccent = color.toLowerCase();
+    const r = Number.parseInt(color.slice(1, 3), 16);
+    const g = Number.parseInt(color.slice(3, 5), 16);
+    const b = Number.parseInt(color.slice(5, 7), 16);
+    document.documentElement.style.setProperty("--theme-accent", color);
+    document.documentElement.style.setProperty("--theme-accent-bright", blendHex(color, "#ffffff", 0.38));
+    document.documentElement.style.setProperty("--theme-accent-dark", blendHex(color, "#21152d", 0.55));
+    document.documentElement.style.setProperty("--theme-accent-rgb", `${r}, ${g}, ${b}`);
+    document.documentElement.style.setProperty("--purple", color);
+    document.documentElement.style.setProperty("--purple-bright", blendHex(color, "#ffffff", 0.38));
+    if (persist) {
+      try { localStorage.setItem("contextcraft-accent", color); } catch { /* The in-memory theme still applies. */ }
+    }
+    try { void getCurrentWindow().setEffects({ effects: [Effect.Acrylic], color: color + "cc" }).catch(() => {}); } catch { /* Browser preview has no native window effect. */ }
+  }
 
   onMount(() => {
     let disposed = false;
     let stopPullListener: (() => void) | undefined;
+    let fileDragDepth = 0;
+    try {
+      const savedAccent = localStorage.getItem("contextcraft-accent");
+      if (savedAccent && /^#[0-9a-f]{6}$/i.test(savedAccent)) setAccent(savedAccent, false);
+      else setAccent("#a457d6", false);
+    } catch { setAccent("#a457d6", false); }
     void refreshStatus();
     void refreshLibrary();
     void listen<{ requestId: string; status: string; total?: number; completed?: number; done: boolean }>("ollama-pull-progress", (event) => {
@@ -45,15 +97,51 @@
       const id = (event as CustomEvent<{ id?: string }>).detail?.id;
       if (id) openLibraryDocument(id);
     };
+    const onFileDragEnter = (event: DragEvent) => {
+      if (!event.dataTransfer?.types.includes("Files")) return;
+      event.preventDefault();
+      fileDragDepth += 1;
+      isFileDropActive = true;
+    };
+    const onFileDragOver = (event: DragEvent) => {
+      if (!event.dataTransfer?.types.includes("Files")) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "copy";
+    };
+    const onFileDragLeave = (event: DragEvent) => {
+      if (!event.dataTransfer?.types.includes("Files")) return;
+      fileDragDepth = Math.max(0, fileDragDepth - 1);
+      if (fileDragDepth === 0) isFileDropActive = false;
+    };
+    const onFileDrop = (event: DragEvent) => {
+      const files = Array.from(event.dataTransfer?.files ?? []);
+      if (!files.length) return;
+      fileDragDepth = 0;
+      isFileDropActive = false;
+      // Let the Notes workspace assign dropped files to its active folder.
+      if (currentPage === "notes") return;
+      event.preventDefault();
+      event.stopPropagation();
+      currentPage = "context";
+      window.setTimeout(() => window.dispatchEvent(new CustomEvent("contextcraft:import-files", { detail: { files } })), 100);
+    };
     window.addEventListener("contextcraft:documents-updated", onLibraryUpdate);
     window.addEventListener("contextcraft:request-file-picker", onRequestFilePicker);
     window.addEventListener("contextcraft:request-open-document", onRequestOpenDocument);
+    window.addEventListener("dragenter", onFileDragEnter, true);
+    window.addEventListener("dragover", onFileDragOver, true);
+    window.addEventListener("dragleave", onFileDragLeave, true);
+    window.addEventListener("drop", onFileDrop, true);
     return () => {
       disposed = true;
       stopPullListener?.();
       window.removeEventListener("contextcraft:documents-updated", onLibraryUpdate);
       window.removeEventListener("contextcraft:request-file-picker", onRequestFilePicker);
       window.removeEventListener("contextcraft:request-open-document", onRequestOpenDocument);
+      window.removeEventListener("dragenter", onFileDragEnter, true);
+      window.removeEventListener("dragover", onFileDragOver, true);
+      window.removeEventListener("dragleave", onFileDragLeave, true);
+      window.removeEventListener("drop", onFileDrop, true);
     };
   });
 
@@ -157,6 +245,9 @@
       <button class="nav-item" class:selected={currentPage === "context"} aria-current={currentPage === "context" ? "page" : undefined} onclick={() => (currentPage = "context")} title="Context workspace">
         <span class="nav-icon">▤</span><span class="nav-label">Context</span>
       </button>
+      <button class="nav-item" class:selected={currentPage === "notes"} aria-current={currentPage === "notes" ? "page" : undefined} onclick={() => (currentPage = "notes")} title="Notes workspace">
+        <span class="nav-icon">▧</span><span class="nav-label">Notes</span>
+      </button>
       <button class="nav-item" class:selected={currentPage === "analytics"} aria-current={currentPage === "analytics" ? "page" : undefined} onclick={() => (currentPage = "analytics")} title="Analytics">
         <span class="nav-icon">▥</span><span class="nav-label">Analytics</span>
       </button>
@@ -174,7 +265,7 @@
     <header class="topbar">
       <div>
         <p class="eyebrow">YOUR AI WORKSPACE</p>
-        <h1>{currentPage === "dashboard" ? "Dashboard" : currentPage === "playground" ? "Playground" : currentPage === "context" ? "Context workspace" : currentPage === "analytics" ? "Analytics" : "Prompt Generator"}</h1>
+        <h1>{currentPage === "dashboard" ? "Dashboard" : currentPage === "playground" ? "Playground" : currentPage === "context" ? "Context workspace" : currentPage === "notes" ? "Notes" : currentPage === "analytics" ? "Analytics" : "Prompt Generator"}</h1>
       </div>
       <div class="topbar-meta">
         <details class="global-library-menu">
@@ -186,10 +277,25 @@
                 <button class="global-library-item" onclick={() => openLibraryDocument(document.id)}><span>{document.name}</span><small>{document.pageCount} pages</small></button>
               {/each}
             {:else}<p class="global-library-empty">No files added yet.</p>{/if}
-            <button class="global-library-add" onclick={openFilePicker}>＋ Add a file</button>
+            <button class="global-library-add" onclick={openFilePicker}>＋ Add files</button>
           </div>
         </details>
         <span class="local-chip"><span class="privacy-dot"></span> Running locally</span>
+        <details class="theme-menu">
+          <summary aria-label="Choose app accent color" title="Appearance"><span class="theme-menu-dot" style={`--theme-swatch:${selectedAccent}`}>◉</span><span>Theme</span></summary>
+          <div class="theme-popover">
+            <p class="eyebrow">ACCENT COLOR</p>
+            <div class="theme-preset-grid">
+              {#each accentPresets as preset (preset.name)}
+                <button class="theme-preset" class:active={selectedAccent === preset.color} onclick={() => setAccent(preset.color)} aria-label={`Use ${preset.name} theme`} title={preset.name}>
+                  <span style={`--theme-swatch:${preset.color}`}></span><small>{preset.name}</small>
+                </button>
+              {/each}
+            </div>
+            <label class="theme-custom"><span>Custom color</span><input type="color" bind:value={customAccent} onchange={(event) => setAccent((event.currentTarget as HTMLInputElement).value)} /></label>
+            <button class="theme-default-button" onclick={() => { customAccent = "#3978e8"; setAccent("#a457d6"); }}>Reset to default purple</button>
+          </div>
+        </details>
         <div class="avatar" aria-label="Local workspace">H</div>
       </div>
     </header>
@@ -336,7 +442,9 @@
       <div hidden={playgroundTab !== "experiments"}><ExperimentView models={status?.models ?? []} baseUrl={baseUrl} connected={connection === "connected"} /></div>
     </div>
     <div hidden={currentPage !== "context"}><ContextView models={status?.models ?? []} baseUrl={baseUrl} connected={connection === "connected"} /></div>
+    <div hidden={currentPage !== "notes"}><NotesView models={status?.models ?? []} baseUrl={baseUrl} connected={connection === "connected"} /></div>
     <div hidden={currentPage !== "analytics"}><AnalyticsView /></div>
     <div hidden={currentPage !== "prompt"}><PromptGeneratorView /></div>
   </main>
+  {#if isFileDropActive}<div class="file-drop-overlay" aria-live="polite"><span>＋</span><strong>Drop files to add them to your library</strong><small>PDF · DOCX · text files · images</small></div>{/if}
 </div>

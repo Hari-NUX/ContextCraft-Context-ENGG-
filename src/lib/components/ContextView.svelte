@@ -5,7 +5,7 @@
   import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
   import MarkdownContent from "./MarkdownContent.svelte";
   import { exportMarkdownAsPdf } from "../services/export";
-  import { deleteDocument, getDocumentIndexCount, indexDocumentChunks, listDocuments, loadDocument, saveDocument, searchDocumentChunks, streamOllamaChat } from "../services/ollama";
+  import { deleteDocument, extractImageText, getDocumentIndexCount, indexDocumentChunks, listDocuments, loadDocument, saveDocument, searchDocumentChunks, streamOllamaChat } from "../services/ollama";
   import type { DocumentChunkInput, DocumentMetadata, DocumentPage, DocumentSearchHit } from "../types/chat";
   import type { OllamaModel } from "../types/ollama";
 
@@ -56,8 +56,13 @@
       const id = (event as CustomEvent<{ id?: string }>).detail?.id;
       if (id) void openDocument(id);
     };
+    const importSharedFiles = (event: Event) => {
+      const files = (event as CustomEvent<{ files?: File[]; folderPath?: string }>).detail;
+      if (files?.files?.length) void importFiles(files.files, files.folderPath);
+    };
     window.addEventListener("contextcraft:open-file-picker", openPicker);
     window.addEventListener("contextcraft:open-document", openSavedDocument);
+    window.addEventListener("contextcraft:import-files", importSharedFiles);
     let disposed = false;
     let unlisten: (() => void) | undefined;
     void listen<StreamPayload>("chat-stream", (event) => {
@@ -78,6 +83,7 @@
       unlisten?.();
       window.removeEventListener("contextcraft:open-file-picker", openPicker);
       window.removeEventListener("contextcraft:open-document", openSavedDocument);
+      window.removeEventListener("contextcraft:import-files", importSharedFiles);
     };
   });
 
@@ -117,88 +123,159 @@
 
   async function importPdf(event: Event) {
     const input = event.currentTarget as HTMLInputElement;
-    const file = input.files?.[0];
-    if (!file) return;
+    const files = Array.from(input.files ?? []);
+    if (files.length) await importFiles(files);
+    input.value = "";
+  }
+
+  async function importFiles(files: File[], explicitFolderPath?: string) {
+    if (!files.length) return;
+    if (isParsing) {
+      errorMessage = "Another import is still running. Wait for it to finish before adding more files.";
+      window.dispatchEvent(new CustomEvent("contextcraft:import-complete", { detail: { folderPath: explicitFolderPath ?? "", attemptedCount: files.length, importedCount: 0, failures: [errorMessage] } }));
+      return;
+    }
     errorMessage = "";
     statusMessage = "";
-    const extension = file.name.toLowerCase().split(".").pop() ?? "";
-    if (!new Set(["pdf", "txt", "md", "markdown", "text"]).has(extension)) {
-      errorMessage = "Choose a PDF, TXT, or Markdown file.";
-      input.value = "";
+    if (files.length > 30) {
+      errorMessage = "Import up to 30 files per batch so indexing stays manageable.";
+      window.dispatchEvent(new CustomEvent("contextcraft:import-complete", { detail: { folderPath: explicitFolderPath ?? "", attemptedCount: files.length, importedCount: 0, failures: [errorMessage] } }));
       return;
     }
-    if (file.size > 60 * 1024 * 1024) {
-      errorMessage = "This checkpoint supports source files up to 60 MB.";
-      input.value = "";
-      return;
-    }
-
     isParsing = true;
-    try {
-      let extractedPages: DocumentPage[] = [];
-      if (extension === "pdf") {
-        const data = new Uint8Array(await file.arrayBuffer());
-        const pdf = await pdfjs.getDocument({ data }).promise;
-        if (pdf.numPages > 600) throw new Error("This checkpoint supports PDFs up to 600 pages.");
-        for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
-          const page = await pdf.getPage(pageNumber);
-          const textContent = await page.getTextContent();
-          const text = textContent.items
-            .map((item) => ("str" in item ? `${item.str}${item.hasEOL ? "\n" : " "}` : ""))
-            .join("")
-            .replace(/[\t ]+/g, " ")
-            .replace(/ *\n */g, "\n")
-            .trim();
-          extractedPages.push({ pageNumber, text });
+    const failures: string[] = [];
+    let imported = 0;
+    for (const [index, file] of files.entries()) {
+      try {
+        statusMessage = `Extracting file ${index + 1} of ${files.length}: ${file.name}`;
+        const extractedPages = await extractFilePages(file);
+        const characterCount = extractedPages.reduce((total, page) => total + page.text.length, 0);
+        if (characterCount > 20_000_000) throw new Error("Extracted text exceeds the 20 million character limit.");
+        if (!characterCount) throw new Error("No readable text was extracted from this file.");
+        const folderPath = explicitFolderPath ?? file.webkitRelativePath.split("/").slice(0, -1).join("/");
+        const saved = await saveDocument(crypto.randomUUID(), file.name, extractedPages, folderPath || undefined);
+        documents = [saved, ...documents.filter((document) => document.id !== saved.id)];
+        selectedId = saved.id;
+        selectedName = saved.name;
+        pages = extractedPages;
+        selectedPageNumber = extractedPages[0]?.pageNumber ?? 1;
+        indexedCount = 0;
+        answer = "";
+        sources = [];
+        imported += 1;
+        window.dispatchEvent(new Event("contextcraft:documents-updated"));
+        if (connected) {
+          isIndexing = true;
+          statusMessage = `Saved ${file.name}. Creating its local search index…`;
+          try {
+            const indexable: DocumentChunkInput[] = makeChunks(extractedPages).map(({ pageNumber, index: chunkIndex, text }) => ({ pageNumber, index: chunkIndex, text }));
+            const result = await indexDocumentChunks(baseUrl, saved.id, indexable);
+            if (selectedId === saved.id) indexedCount = result.indexedCount;
+          } catch (indexError) {
+            const detail = indexError instanceof Error ? indexError.message : String(indexError);
+            failures.push(`${file.name}: indexing failed (${detail})`);
+          } finally {
+            isIndexing = false;
+          }
         }
-      } else {
-        if (file.size > 20 * 1024 * 1024) throw new Error("Text and Markdown files are limited to 20 MB.");
-        const text = (await file.text()).replace(/\r\n?/g, "\n").trim();
-        extractedPages = text.split("\f").map((pageText, index) => ({ pageNumber: index + 1, text: pageText.trim() }));
+      } catch (error) {
+        failures.push(`${file.name}: ${error instanceof Error ? error.message : String(error)}`);
       }
-      const characterCount = extractedPages.reduce((total, page) => total + page.text.length, 0);
-      if (characterCount > 20_000_000) throw new Error("This source has too much extracted text for this checkpoint (limit: 20 million characters).");
-
-      const id = crypto.randomUUID();
-      const saved = await saveDocument(id, file.name, extractedPages);
-      documents = [saved, ...documents.filter((document) => document.id !== saved.id)];
-      window.dispatchEvent(new Event("contextcraft:documents-updated"));
-      selectedId = saved.id;
-      selectedName = saved.name;
-      pages = extractedPages;
-      selectedPageNumber = extractedPages[0]?.pageNumber ?? 1;
-      indexedCount = 0;
-      answer = "";
-      sources = [];
-      statusMessage = characterCount
-        ? `Extracted ${characterCount.toLocaleString()} characters from ${saved.pageCount} ${extension === "pdf" ? "PDF pages" : "text section(s)"}. The original file was not copied into app storage.`
-        : extension === "pdf"
-          ? "No selectable text was found. This may be a scanned PDF; OCR is not included in this checkpoint."
-          : "This text file is empty.";
-      if (characterCount && connected) {
-        isIndexing = true;
-        statusMessage = "File saved. Creating its local search index automatically…";
-        try {
-          const indexable: DocumentChunkInput[] = makeChunks(extractedPages).map(({ pageNumber, index, text }) => ({ pageNumber, index, text }));
-          const result = await indexDocumentChunks(baseUrl, saved.id, indexable);
-          indexedCount = result.indexedCount;
-          statusMessage = `Imported and automatically indexed ${result.indexedCount} chunks. You can re-index them manually below at any time.`;
-        } catch (indexError) {
-          const detail = indexError instanceof Error ? indexError.message : String(indexError);
-          statusMessage = `File saved, but automatic indexing failed: ${detail} Use Index chunks below to retry manually.`;
-        } finally {
-          isIndexing = false;
-        }
-      } else if (characterCount) {
-        statusMessage = "File saved. Ollama is offline, so indexing was skipped; reconnect and use Index chunks when ready.";
-      }
-      window.dispatchEvent(new Event("contextcraft:documents-updated"));
-    } catch (error) {
-      errorMessage = error instanceof Error ? error.message : String(error);
-    } finally {
-      isParsing = false;
-      input.value = "";
     }
+    isParsing = false;
+    window.dispatchEvent(new Event("contextcraft:documents-updated"));
+    if (imported) statusMessage = `Imported ${imported} of ${files.length} file(s). Files are stored as extracted text and indexed locally when Ollama is available.${connected ? "" : " Reconnect to Ollama to index them."}`;
+    if (failures.length) errorMessage = failures.slice(0, 5).join(" · ") + (failures.length > 5 ? ` · and ${failures.length - 5} more failure(s)` : "");
+    window.dispatchEvent(new CustomEvent("contextcraft:import-complete", { detail: { folderPath: explicitFolderPath ?? "", attemptedCount: files.length, importedCount: imported, failures } }));
+  }
+
+  async function extractFilePages(file: File): Promise<DocumentPage[]> {
+    const extension = file.name.toLowerCase().split(".").pop() ?? "";
+    const imageExtensions = new Set(["png", "jpg", "jpeg", "webp"]);
+    if (imageExtensions.has(extension)) {
+      if (file.size > 20 * 1024 * 1024) throw new Error("Images are limited to 20 MB.");
+      const visionModel = chatModels.find((model) => /vision|qwen\d.*-vl|llava|moondream|bakllava/i.test(model.name));
+      if (!visionModel) throw new Error("Image reading needs an installed Ollama vision model such as qwen3-vl.");
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => typeof reader.result === "string" ? resolve(reader.result) : reject(new Error("Could not read the image."));
+        reader.onerror = () => reject(new Error("Could not read the image."));
+        reader.readAsDataURL(file);
+      });
+      const imageBase64 = dataUrl.split(",", 2)[1];
+      if (!imageBase64) throw new Error("Could not encode this image for the local vision model.");
+      const extracted = await extractImageText(baseUrl, visionModel.name, imageBase64);
+      return [{ pageNumber: 1, text: extracted }];
+    }
+
+    if (file.size > 60 * 1024 * 1024) throw new Error("Source files are limited to 60 MB.");
+    if (extension === "pdf") {
+      const data = new Uint8Array(await file.arrayBuffer());
+      const pdf = await pdfjs.getDocument({ data }).promise;
+      if (pdf.numPages > 600) throw new Error("PDFs are limited to 600 pages.");
+      const extractedPages: DocumentPage[] = [];
+      for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+        const page = await pdf.getPage(pageNumber);
+        const textContent = await page.getTextContent();
+        const text = textContent.items.map((item) => ("str" in item ? `${item.str}${item.hasEOL ? "\n" : " "}` : ""))
+          .join("").replace(/[\t ]+/g, " ").replace(/ *\n */g, "\n").trim();
+        extractedPages.push({ pageNumber, text });
+      }
+      return extractedPages;
+    }
+    if (extension === "docx") return [{ pageNumber: 1, text: await extractDocxText(await file.arrayBuffer()) }];
+    const textExtensions = new Set(["txt", "md", "markdown", "text", "csv", "json", "html", "htm", "xml", "yaml", "yml", "log", "rtf"]);
+    if (!textExtensions.has(extension)) throw new Error("Supported formats: PDF, DOCX, TXT, Markdown, CSV, JSON, HTML, XML, YAML, LOG, RTF, PNG, JPG, and WEBP.");
+    if (file.size > 20 * 1024 * 1024) throw new Error("Text-based files are limited to 20 MB.");
+    let text = (await file.text()).replace(/\r\n?/g, "\n").trim();
+    if (extension === "html" || extension === "htm") text = new DOMParser().parseFromString(text, "text/html").body.textContent ?? text;
+    if (extension === "rtf") text = text.replace(/\\par[d]?\b/g, "\n").replace(/\\'[0-9a-f]{2}/gi, " ").replace(/\\[a-z]+-?\d* ?/gi, " ").replace(/[{}]/g, "");
+    return text.split("\f").map((pageText, pageIndex) => ({ pageNumber: pageIndex + 1, text: pageText.trim() }));
+  }
+
+  async function extractDocxText(buffer: ArrayBuffer): Promise<string> {
+    const bytes = new Uint8Array(buffer);
+    const view = new DataView(buffer);
+    let endRecord = -1;
+    for (let offset = Math.max(0, bytes.length - 65_557); offset <= bytes.length - 22; offset += 1) {
+      if (view.getUint32(offset, true) === 0x06054b50) endRecord = offset;
+    }
+    if (endRecord < 0) throw new Error("This DOCX file has an invalid ZIP container.");
+    const entries = view.getUint16(endRecord + 10, true);
+    let entryOffset = view.getUint32(endRecord + 16, true);
+    const decoder = new TextDecoder();
+    for (let index = 0; index < entries; index += 1) {
+      if (view.getUint32(entryOffset, true) !== 0x02014b50) break;
+      const method = view.getUint16(entryOffset + 10, true);
+      const compressedSize = view.getUint32(entryOffset + 20, true);
+      const expandedSize = view.getUint32(entryOffset + 24, true);
+      const nameLength = view.getUint16(entryOffset + 28, true);
+      const extraLength = view.getUint16(entryOffset + 30, true);
+      const commentLength = view.getUint16(entryOffset + 32, true);
+      const localOffset = view.getUint32(entryOffset + 42, true);
+      const fileName = decoder.decode(bytes.slice(entryOffset + 46, entryOffset + 46 + nameLength));
+      if (fileName === "word/document.xml") {
+        if (expandedSize > 20 * 1024 * 1024) throw new Error("This DOCX expands beyond the 20 MB text limit.");
+        if (view.getUint32(localOffset, true) !== 0x04034b50) throw new Error("This DOCX document entry is invalid.");
+        const localNameLength = view.getUint16(localOffset + 26, true);
+        const localExtraLength = view.getUint16(localOffset + 28, true);
+        const dataOffset = localOffset + 30 + localNameLength + localExtraLength;
+        const compressed = bytes.slice(dataOffset, dataOffset + compressedSize);
+        let xml: string;
+        if (method === 0) xml = decoder.decode(compressed);
+        else if (method === 8) {
+          const stream = new Blob([compressed]).stream().pipeThrough(new DecompressionStream("deflate-raw" as CompressionFormat));
+          xml = await new Response(stream).text();
+        } else throw new Error("This DOCX uses an unsupported compression method.");
+        const documentXml = new DOMParser().parseFromString(xml, "application/xml");
+        const wordNamespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+        return Array.from(documentXml.getElementsByTagNameNS(wordNamespace, "p"))
+          .map((paragraph) => Array.from(paragraph.getElementsByTagNameNS(wordNamespace, "t")).map((part) => part.textContent ?? "").join(""))
+          .filter(Boolean).join("\n");
+      }
+      entryOffset += 46 + nameLength + extraLength + commentLength;
+    }
+    throw new Error("Could not find readable document text inside this DOCX file.");
   }
 
   async function removeDocument(document: DocumentMetadata) {
@@ -322,12 +399,12 @@
     <div>
       <p class="eyebrow accent-text">CHECKPOINT 06</p>
       <h2>Context workspace</h2>
-      <p class="muted">Import PDFs, text files, or Markdown. Inspect extracted content and preview the chunks the context engine will use.</p>
+      <p class="muted">Add one or several PDFs, DOCX, text files, or images. Browse for files or drop them anywhere in the app.</p>
     </div>
     <div>
-      <input bind:this={fileInput} class="visually-hidden-file" type="file" accept="application/pdf,.pdf,.txt,.md,.markdown,.text,text/plain,text/markdown" onchange={importPdf} />
+      <input bind:this={fileInput} class="visually-hidden-file" type="file" multiple accept="application/pdf,.pdf,.docx,.txt,.md,.markdown,.text,.csv,.json,.html,.htm,.xml,.yaml,.yml,.log,.rtf,.png,.jpg,.jpeg,.webp,text/plain,text/markdown" onchange={importPdf} />
       <button class="context-import-button" onclick={() => fileInput?.click()} disabled={isParsing}>
-        {isParsing ? "Extracting file…" : "＋ Import a file"}
+        {isParsing ? "Importing files…" : "＋ Browse files"}
       </button>
     </div>
   </div>
@@ -341,7 +418,7 @@
       {#if isLoading}
         <p class="document-empty">Loading local documents…</p>
       {:else if documents.length === 0}
-        <p class="document-empty">No documents yet. Import a PDF, TXT, or Markdown file to get started.</p>
+        <p class="document-empty">No documents yet. Browse for files or drop them here to get started.</p>
       {:else}
         <div class="document-list">
           {#each documents as document (document.id)}
@@ -437,7 +514,7 @@
           </div>
         {/if}
       {:else}
-        <div class="context-empty-state"><span class="empty-icon">▤</span><strong>Your document workspace is ready</strong><p>Import a text-based PDF, TXT, or Markdown file. ContextCraft will extract and save its text locally for inspection.</p><button class="context-import-button" onclick={() => fileInput?.click()} disabled={isParsing}>Import your first file</button></div>
+        <div class="context-empty-state"><span class="empty-icon">▤</span><strong>Your document workspace is ready</strong><p>Import documents or images. ContextCraft extracts text and saves it locally for inspection and search.</p><button class="context-import-button" onclick={() => fileInput?.click()} disabled={isParsing}>Browse files</button></div>
       {/if}
     </div>
   </div>

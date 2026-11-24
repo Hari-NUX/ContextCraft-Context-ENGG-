@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Default capability for the ContextCraft main window",
   "windows": ["main"],
-  "permissions": ["core:default", "core:event:allow-listen", "core:event:allow-unlisten"]
+  "permissions": ["core:default", "core:event:allow-listen", "core:event:allow-unlisten", "core:window:allow-set-effects"]
 }
