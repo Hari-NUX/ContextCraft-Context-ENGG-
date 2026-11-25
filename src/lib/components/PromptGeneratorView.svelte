@@ -206,10 +206,10 @@
   .prompt-section-title { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:15px; }
   .prompt-section-title .eyebrow { margin-bottom:5px; }
   .prompt-section-title h3 { margin:0; font:650 14px Manrope,"Segoe UI",sans-serif; letter-spacing:-.02em; }
-  .prompt-step { display:grid; place-items:center; width:27px; height:27px; flex:none; border:1px solid #b578e33a; border-radius:8px; color:#d6b3f3; background:#a653d612; font-size:9px; }
-  .prompt-label { display:grid; gap:7px; margin:0 0 13px; color:#bcb3c9; font-size:9px; font-weight:600; }
-  .prompt-textarea,.prompt-select,.generated-prompt { width:100%; min-width:0; border:1px solid #ffffff16; border-radius:9px; outline:none; color:#e8e0ef; background:#110f1880; font:10px/1.55 "Segoe UI",sans-serif; }
-  .prompt-textarea:focus,.prompt-select:focus,.generated-prompt:focus { border-color:#bd84f878; box-shadow:0 0 0 3px #a454dc12; }
+  .prompt-step { display:grid; place-items:center; width:27px; height:27px; flex:none; border:1px solid rgba(var(--theme-accent-rgb), 0.227); border-radius:8px; color:#e7e9ed; background:rgba(var(--theme-accent-rgb), 0.0706); font-size:9px; }
+  .prompt-label { display:grid; gap:7px; margin:0 0 13px; color:#e7e9ed; font-size:9px; font-weight:600; }
+  .prompt-textarea,.prompt-select,.generated-prompt { width:100%; min-width:0; border:1px solid #ffffff16; border-radius:9px; outline:none; color:#e7e9ed; background:#110f1880; font:10px/1.55 "Segoe UI",sans-serif; }
+  .prompt-textarea:focus,.prompt-select:focus,.generated-prompt:focus { border-color:#e7e9ed; box-shadow:0 0 0 3px rgba(var(--theme-accent-rgb), 0.0706); }
   .prompt-textarea { resize:vertical; padding:9px 10px; }
   .prompt-topic { min-height:74px; }
   .prompt-notes { min-height:75px; }
@@ -217,13 +217,13 @@
   .prompt-fields-grid { display:grid; grid-template-columns:1fr 1fr; gap:0 12px; }
   .prompt-divider { height:1px; margin:5px 0 18px; background:#ffffff10; }
   .prompt-doc-title { margin-bottom:5px; }
-  .prompt-help { margin:0 0 13px; color:#92899f; font-size:9px; line-height:1.5; }
+  .prompt-help { margin:0 0 13px; color:#e7e9ed; font-size:9px; line-height:1.5; }
   .prompt-scope-grid { align-items:center; }
   .prompt-check { display:flex; align-items:flex-start; gap:9px; min-height:49px; margin:0 0 13px; padding:8px; border:1px solid #ffffff10; border-radius:8px; background:#ffffff04; cursor:pointer; }
-  .prompt-check input { accent-color:#ae68e1; margin:2px 0 0; }
+  .prompt-check input { accent-color:#e7e9ed; margin:2px 0 0; }
   .prompt-check span { display:grid; gap:4px; }
-  .prompt-check strong { color:#d1c6dc; font-size:8px; }
-  .prompt-check small { color:#8e849a; font-size:8px; line-height:1.45; }
+  .prompt-check strong { color:#e7e9ed; font-size:8px; }
+  .prompt-check small { color:#e7e9ed; font-size:8px; line-height:1.45; }
   .prompt-side-column { display:grid; gap:13px; }
   .prompt-advice-card { padding:17px; border:1px solid #56d7a02a; border-radius:15px; background:linear-gradient(145deg,#338f6515,#2a805209); }
   .prompt-advice-icon { display:grid; place-items:center; width:30px; height:30px; margin-bottom:12px; border:1px solid #65d9a02e; border-radius:9px; color:#8be0b7; background:#53d7a014; }
@@ -234,7 +234,7 @@
   .prompt-document-meta span { overflow:hidden; color:#d5eddf; font-size:8px; text-overflow:ellipsis; white-space:nowrap; }
   .prompt-document-meta small { color:#88a593; font-size:8px; }
   .generated-card .prompt-section-title { margin-bottom:8px; }
-  .generated-prompt { display:block; min-height:325px; resize:vertical; padding:11px; color:#cfc4d9; background:#100e18a8; font-family:Consolas,"Courier New",monospace; font-size:9px; }
+  .generated-prompt { display:block; min-height:325px; resize:vertical; padding:11px; color:#e7e9ed; background:#100e18a8; font-family:Consolas,"Courier New",monospace; font-size:9px; }
   .prompt-copy-button { width:100%; justify-content:center; margin-top:10px; }
   .prompt-footnote { display:flex; align-items:flex-start; gap:7px; margin:0 3px; color:#8c8496; font-size:8px; line-height:1.5; }
   .prompt-footnote .privacy-dot { width:6px; height:6px; margin-top:2px; }

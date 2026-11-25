@@ -27,8 +27,8 @@ import { Effect, getCurrentWindow } from "@tauri-apps/api/window";
   let pullNotice = $state("");
   let isPullingModel = $state(false);
   let isFileDropActive = $state(false);
-  let selectedAccent = $state("#a457d6");
-  let customAccent = $state("#3978e8");
+  let selectedAccent = $state("#159e9a");
+  let customAccent = $state("#159e9a");
   let pullPercent = $derived(pullProgress?.done ? 100 : pullProgress?.total ? Math.min(100, Math.round(((pullProgress.completed ?? 0) / pullProgress.total) * 100)) : 0);
   const connected = $derived(connection === "connected");
 
@@ -60,30 +60,38 @@ import { Effect, getCurrentWindow } from "@tauri-apps/api/window";
   function setAccent(color: string, persist = true) {
     if (!/^#[0-9a-f]{6}$/i.test(color)) return;
     selectedAccent = color.toLowerCase();
+    customAccent = color.toLowerCase();
     const r = Number.parseInt(color.slice(1, 3), 16);
     const g = Number.parseInt(color.slice(3, 5), 16);
     const b = Number.parseInt(color.slice(5, 7), 16);
     document.documentElement.style.setProperty("--theme-accent", color);
     document.documentElement.style.setProperty("--theme-accent-bright", blendHex(color, "#ffffff", 0.38));
-    document.documentElement.style.setProperty("--theme-accent-dark", blendHex(color, "#21152d", 0.55));
+    document.documentElement.style.setProperty("--theme-accent-dark", blendHex(color, "#20242b", 0.55));
     document.documentElement.style.setProperty("--theme-accent-rgb", `${r}, ${g}, ${b}`);
     document.documentElement.style.setProperty("--purple", color);
     document.documentElement.style.setProperty("--purple-bright", blendHex(color, "#ffffff", 0.38));
     if (persist) {
       try { localStorage.setItem("contextcraft-accent", color); } catch { /* The in-memory theme still applies. */ }
     }
-    try { void getCurrentWindow().setEffects({ effects: [Effect.Acrylic], color: color + "cc" }).catch(() => {}); } catch { /* Browser preview has no native window effect. */ }
+    try { void getCurrentWindow().setEffects({ effects: [Effect.Acrylic], color: color + "3d" }).catch(() => {}); } catch { /* Browser preview has no native window effect. */ }
   }
 
   onMount(() => {
     let disposed = false;
     let stopPullListener: (() => void) | undefined;
     let fileDragDepth = 0;
+    const closeMenusOnOutsideClick = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      document.querySelectorAll<HTMLDetailsElement>(".theme-menu[open], .global-library-menu[open], .chat-settings[open]").forEach((menu) => {
+        if (!menu.contains(target)) menu.open = false;
+      });
+    };
     try {
       const savedAccent = localStorage.getItem("contextcraft-accent");
       if (savedAccent && /^#[0-9a-f]{6}$/i.test(savedAccent)) setAccent(savedAccent, false);
-      else setAccent("#a457d6", false);
-    } catch { setAccent("#a457d6", false); }
+      else setAccent("#159e9a", false);
+    } catch { setAccent("#159e9a", false); }
     void refreshStatus();
     void refreshLibrary();
     void listen<{ requestId: string; status: string; total?: number; completed?: number; done: boolean }>("ollama-pull-progress", (event) => {
@@ -122,26 +130,32 @@ import { Effect, getCurrentWindow } from "@tauri-apps/api/window";
       if (currentPage === "notes") return;
       event.preventDefault();
       event.stopPropagation();
+      if (currentPage === "playground") {
+        window.dispatchEvent(new CustomEvent("contextcraft:import-files", { detail: { files } }));
+        return;
+      }
       currentPage = "context";
       window.setTimeout(() => window.dispatchEvent(new CustomEvent("contextcraft:import-files", { detail: { files } })), 100);
     };
     window.addEventListener("contextcraft:documents-updated", onLibraryUpdate);
+    document.addEventListener("pointerdown", closeMenusOnOutsideClick);
     window.addEventListener("contextcraft:request-file-picker", onRequestFilePicker);
     window.addEventListener("contextcraft:request-open-document", onRequestOpenDocument);
     window.addEventListener("dragenter", onFileDragEnter, true);
     window.addEventListener("dragover", onFileDragOver, true);
     window.addEventListener("dragleave", onFileDragLeave, true);
-    window.addEventListener("drop", onFileDrop, true);
+    window.addEventListener("drop", onFileDrop);
     return () => {
       disposed = true;
       stopPullListener?.();
       window.removeEventListener("contextcraft:documents-updated", onLibraryUpdate);
+      document.removeEventListener("pointerdown", closeMenusOnOutsideClick);
       window.removeEventListener("contextcraft:request-file-picker", onRequestFilePicker);
       window.removeEventListener("contextcraft:request-open-document", onRequestOpenDocument);
       window.removeEventListener("dragenter", onFileDragEnter, true);
       window.removeEventListener("dragover", onFileDragOver, true);
       window.removeEventListener("dragleave", onFileDragLeave, true);
-      window.removeEventListener("drop", onFileDrop, true);
+      window.removeEventListener("drop", onFileDrop);
     };
   });
 
@@ -246,13 +260,13 @@ import { Effect, getCurrentWindow } from "@tauri-apps/api/window";
         <span class="nav-icon">▤</span><span class="nav-label">Context</span>
       </button>
       <button class="nav-item" class:selected={currentPage === "notes"} aria-current={currentPage === "notes" ? "page" : undefined} onclick={() => (currentPage = "notes")} title="Notes workspace">
-        <span class="nav-icon">▧</span><span class="nav-label">Notes</span>
+        <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4.5h12a2 2 0 0 1 2 2v13H7a2 2 0 0 1-2-2z"/><path d="M8 4.5v15M11 9h5M11 12.5h5M11 16h4"/></svg><span class="nav-label">Notes</span>
       </button>
       <button class="nav-item" class:selected={currentPage === "analytics"} aria-current={currentPage === "analytics" ? "page" : undefined} onclick={() => (currentPage = "analytics")} title="Analytics">
-        <span class="nav-icon">▥</span><span class="nav-label">Analytics</span>
+        <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5h16"/><rect x="5.5" y="11" width="3.5" height="6.5" rx=".8"/><rect x="10.5" y="7.5" width="3.5" height="10" rx=".8"/><rect x="15.5" y="4" width="3.5" height="13.5" rx=".8"/></svg><span class="nav-label">Analytics</span>
       </button>
       <button class="nav-item" class:selected={currentPage === "prompt"} aria-current={currentPage === "prompt" ? "page" : undefined} onclick={() => (currentPage = "prompt")} title="Prompt Generator">
-        <span class="nav-icon">✦</span><span class="nav-label">Prompt</span>
+        <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m12 2.8 1.7 6.1 6.1 1.7-6.1 1.7-1.7 6.1-1.7-6.1-6.1-1.7 6.1-1.7z"/><path d="m19 15 .8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"/></svg><span class="nav-label">Prompt</span>
       </button>
     </div>
     <div class="sidebar-bottom">
@@ -293,7 +307,7 @@ import { Effect, getCurrentWindow } from "@tauri-apps/api/window";
               {/each}
             </div>
             <label class="theme-custom"><span>Custom color</span><input type="color" bind:value={customAccent} onchange={(event) => setAccent((event.currentTarget as HTMLInputElement).value)} /></label>
-            <button class="theme-default-button" onclick={() => { customAccent = "#3978e8"; setAccent("#a457d6"); }}>Reset to default purple</button>
+            <button class="theme-default-button" onclick={() => setAccent("#159e9a")}>Reset to teal</button>
           </div>
         </details>
         <div class="avatar" aria-label="Local workspace">H</div>

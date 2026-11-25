@@ -193,6 +193,13 @@ import { getDocumentIndexCount, listDocuments, loadDocument, saveExperimentMetri
     }
   }
 
+  function handleQuestionKeydown(event: KeyboardEvent) {
+    if (event.key === "Enter" && (!event.shiftKey || event.ctrlKey)) {
+      event.preventDefault();
+      void runComparison();
+    }
+  }
+
   function tokenLabel(value: number | undefined) {
     return typeof value === "number" ? value.toLocaleString() : "—";
   }
@@ -231,7 +238,7 @@ import { getDocumentIndexCount, listDocuments, loadDocument, saveExperimentMetri
         {isRunning ? "Running comparison…" : selectedDocumentId ? "Run all three ↗" : "Run two modes ↗"}
       </button>
     </div>
-    <label class="experiment-question">SAME QUESTION FOR EACH RUN<textarea bind:value={question} rows="2" placeholder="Ask a question about the selected file…" disabled={isRunning}></textarea></label>
+    <label class="experiment-question">SAME QUESTION FOR EACH RUN<textarea bind:value={question} onkeydown={handleQuestionKeydown} rows="2" placeholder="Ask a question about the selected file…" disabled={isRunning}></textarea><small>Enter or Ctrl+Enter to run · Shift+Enter for a new line</small></label>
     <div class="experiment-fairness"><span class="privacy-dot"></span><span>Basic and Prompt Engineering are no-source baselines. Compare Full file vs Light or Standard with the same file, question, and model to evaluate context token savings. Full-file mode is capped at 6,000 extracted characters; larger files should use retrieval.</span></div>
     {#if isLoadingDocuments}<p class="muted experiment-message">Loading indexed documents…</p>
     {:else if contextDepth === "full" && selectedDocument && selectedDocument.extractedChars > 6000}<p class="experiment-message warning-text">This file exceeds the Full-file limit. Choose Light or Standard retrieval, or select a smaller file.</p>

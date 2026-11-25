@@ -35,12 +35,21 @@
   let isIndexing = $state(false);
   let isAsking = $state(false);
   let activeRequestId = $state("");
+  let inspectorOpen = $state(true);
 
   const chatModels = $derived(models.filter((model) => !/embed|embedding/i.test(model.name)));
 
   const selectedDocument = $derived(documents.find((document) => document.id === selectedId) ?? null);
   const selectedPage = $derived(pages.find((page) => page.pageNumber === selectedPageNumber) ?? pages[0] ?? null);
   const chunks = $derived(makeChunks(pages));
+
+  function documentIcon(name: string) {
+    const extension = name.toLowerCase().split(".").pop();
+    if (extension === "pdf") return "PDF";
+    if (extension === "docx" || extension === "rtf") return "DOC";
+    if (["png", "jpg", "jpeg", "webp"].includes(extension ?? "")) return "IMG";
+    return "TXT";
+  }
 
   function exportContextPdf() {
     if (!selectedDocument) return;
@@ -57,8 +66,8 @@
       if (id) void openDocument(id);
     };
     const importSharedFiles = (event: Event) => {
-      const files = (event as CustomEvent<{ files?: File[]; folderPath?: string }>).detail;
-      if (files?.files?.length) void importFiles(files.files, files.folderPath);
+      const files = (event as CustomEvent<{ files?: File[]; folderPath?: string; visionModel?: string }>).detail;
+      if (files?.files?.length) void importFiles(files.files, files.folderPath, files.visionModel);
     };
     window.addEventListener("contextcraft:open-file-picker", openPicker);
     window.addEventListener("contextcraft:open-document", openSavedDocument);
@@ -128,7 +137,7 @@
     input.value = "";
   }
 
-  async function importFiles(files: File[], explicitFolderPath?: string) {
+  async function importFiles(files: File[], explicitFolderPath?: string, preferredVisionModel?: string) {
     if (!files.length) return;
     if (isParsing) {
       errorMessage = "Another import is still running. Wait for it to finish before adding more files.";
@@ -148,7 +157,7 @@
     for (const [index, file] of files.entries()) {
       try {
         statusMessage = `Extracting file ${index + 1} of ${files.length}: ${file.name}`;
-        const extractedPages = await extractFilePages(file);
+        const extractedPages = await extractFilePages(file, preferredVisionModel);
         const characterCount = extractedPages.reduce((total, page) => total + page.text.length, 0);
         if (characterCount > 20_000_000) throw new Error("Extracted text exceeds the 20 million character limit.");
         if (!characterCount) throw new Error("No readable text was extracted from this file.");
@@ -189,12 +198,12 @@
     window.dispatchEvent(new CustomEvent("contextcraft:import-complete", { detail: { folderPath: explicitFolderPath ?? "", attemptedCount: files.length, importedCount: imported, failures } }));
   }
 
-  async function extractFilePages(file: File): Promise<DocumentPage[]> {
+  async function extractFilePages(file: File, preferredVisionModel?: string): Promise<DocumentPage[]> {
     const extension = file.name.toLowerCase().split(".").pop() ?? "";
     const imageExtensions = new Set(["png", "jpg", "jpeg", "webp"]);
     if (imageExtensions.has(extension)) {
       if (file.size > 20 * 1024 * 1024) throw new Error("Images are limited to 20 MB.");
-      const visionModel = chatModels.find((model) => /vision|qwen\d.*-vl|llava|moondream|bakllava/i.test(model.name));
+      const visionModel = chatModels.find((model) => model.name === preferredVisionModel) ?? chatModels.find((model) => /vision|qwen\d.*-vl|llava|moondream|bakllava/i.test(model.name));
       if (!visionModel) throw new Error("Image reading needs an installed Ollama vision model such as qwen3-vl.");
       const dataUrl = await new Promise<string>((resolve, reject) => {
         const reader = new FileReader();
@@ -371,6 +380,13 @@
     }
   }
 
+  function handleQuestionKeydown(event: KeyboardEvent) {
+    if (event.key === "Enter" && (!event.shiftKey || event.ctrlKey)) {
+      event.preventDefault();
+      (event.currentTarget as HTMLTextAreaElement).form?.requestSubmit();
+    }
+  }
+
   function makeChunks(sourcePages: DocumentPage[]) {
     const output: { pageNumber: number; index: number; text: string }[] = [];
     for (const page of sourcePages) {
@@ -394,26 +410,27 @@
   }
 </script>
 
-<section class="context-page">
+<section class="context-page context-workspace-page">
   <div class="context-heading">
     <div>
       <p class="eyebrow accent-text">CHECKPOINT 06</p>
       <h2>Context workspace</h2>
       <p class="muted">Add one or several PDFs, DOCX, text files, or images. Browse for files or drop them anywhere in the app.</p>
     </div>
-    <div>
+    <div class="context-heading-actions">
       <input bind:this={fileInput} class="visually-hidden-file" type="file" multiple accept="application/pdf,.pdf,.docx,.txt,.md,.markdown,.text,.csv,.json,.html,.htm,.xml,.yaml,.yml,.log,.rtf,.png,.jpg,.jpeg,.webp,text/plain,text/markdown" onchange={importPdf} />
       <button class="context-import-button" onclick={() => fileInput?.click()} disabled={isParsing}>
         {isParsing ? "Importing files…" : "＋ Browse files"}
       </button>
+      <button class="context-import-button context-inspector-toggle" onclick={() => (inspectorOpen = !inspectorOpen)} aria-expanded={inspectorOpen} aria-controls="context-inspector">{inspectorOpen ? "Hide inspector" : "Show inspector"}</button>
     </div>
   </div>
 
   {#if errorMessage}<div class="storage-error" role="alert">{errorMessage}</div>{/if}
   {#if statusMessage}<div class="context-status" role="status"><span class="privacy-dot"></span>{statusMessage}</div>{/if}
 
-  <div class="context-layout">
-    <aside class="document-library">
+  <div class="context-layout context-workspace-layout" class:inspector-collapsed={!inspectorOpen}>
+    <aside class="document-library context-source-rail">
       <div class="document-library-heading"><div><p class="eyebrow">LOCAL LIBRARY</p><h3>Study documents</h3></div><span class="history-count">{documents.length}</span></div>
       {#if isLoading}
         <p class="document-empty">Loading local documents…</p>
@@ -424,6 +441,7 @@
           {#each documents as document (document.id)}
             <article class="document-list-item" class:active={document.id === selectedId}>
               <button class="document-open" onclick={() => openDocument(document.id)}>
+                <span class="context-file-kind">{documentIcon(document.name)}</span>
                 <span class="document-name">{document.name}</span>
                 <span class="history-meta">{document.pageCount} pages · {document.extractedChars.toLocaleString()} characters</span>
               </button>
@@ -435,57 +453,8 @@
       <div class="document-storage-note"><strong>Local text storage</strong><p>Extracted text is stored in this Windows user account. The original source file is not retained by ContextCraft.</p></div>
     </aside>
 
-    <div class="context-main">
+    <main class="context-main">
       {#if selectedDocument}
-        <div class="document-title-row">
-          <div><p class="eyebrow">DOCUMENT INSPECTOR</p><h3>{selectedName}</h3></div>
-          <button class="secondary-button" onclick={exportContextPdf} disabled={!pages.length}>Export full context PDF</button>
-          <span class="document-stat">{pages.length} pages · {chunks.length} preview chunks · {indexedCount} embedded</span>
-        </div>
-        <details class="document-ask-panel" open>
-          <summary><span>✦ Ask this document</span><small>{indexedCount ? `${indexedCount} chunks indexed` : "Index chunks to enable grounded questions"}</small></summary>
-          <div class="document-ask-body">
-            <div class="document-ask-controls">
-              <label for="document-model">MODEL</label>
-              <select id="document-model" bind:value={selectedModel} disabled={chatModels.length === 0 || isAsking}>
-                {#each chatModels as model}<option value={model.name}>{model.name}</option>{/each}
-              </select>
-              <label for="document-context-depth">CONTEXT</label>
-              <select id="document-context-depth" bind:value={contextDepth} disabled={isAsking}>
-                <option value="light">Light · 2 short passages</option><option value="standard">Standard · up to 5 passages</option>
-              </select>
-              <button class="memory-index-button" onclick={buildDocumentIndex} disabled={isIndexing || !connected || chunks.length === 0}>
-                {isIndexing ? "Embedding chunks…" : indexedCount ? "Re-index chunks" : "Index chunks"}
-              </button>
-            </div>
-            <form class="document-question-form" onsubmit={(event) => { event.preventDefault(); void askDocument(); }}>
-              <textarea bind:value={query} rows="2" placeholder="Ask a question about this document…" disabled={!connected || isAsking}></textarea>
-              <button class="send-button" type="submit" disabled={!query.trim() || !connected || isAsking || indexedCount === 0 || !selectedModel}>
-                {isAsking ? "Searching / answering…" : "Ask from document ↗"}
-              </button>
-            </form>
-            {#if indexedCount === 0}
-              <p class="document-index-hint">You can write your question now. Click <strong>Index chunks</strong> if automatic indexing was unavailable; the Ask button will enable when indexing finishes.</p>
-            {/if}
-            {#if answer}
-              <div class="document-answer">
-                <div class="preview-heading"><div><p class="eyebrow">GROUNDED RESPONSE</p><h4>{selectedModel}</h4></div></div>
-                <MarkdownContent source={answer} />
-              </div>
-            {:else if isAsking}
-              <div class="document-answer-loading"><span class="spin">⟳</span> Retrieving passages and generating an answer…</div>
-            {/if}
-            {#if sources.length}
-              <div class="document-sources"><span class="eyebrow">RETRIEVED SOURCES</span>
-                {#each sources as source, index}
-                  <button onclick={() => (selectedPageNumber = source.pageNumber)} title="Open this source page">
-                    <strong>Source {index + 1} · page {source.pageNumber}</strong><span>{pageScopeUsed ? "requested page" : `${Math.round(source.score * 100)}% match`}</span><p>{source.text}</p>
-                  </button>
-                {/each}
-              </div>
-            {/if}
-          </div>
-        </details>
         {#if chunks.length === 0}
           <div class="context-empty-state"><span class="empty-icon">▤</span><strong>No selectable text was extracted</strong><p>This may be a scanned document. OCR and image understanding are planned for a later checkpoint.</p></div>
         {:else}
@@ -516,7 +485,24 @@
       {:else}
         <div class="context-empty-state"><span class="empty-icon">▤</span><strong>Your document workspace is ready</strong><p>Import documents or images. ContextCraft extracts text and saves it locally for inspection and search.</p><button class="context-import-button" onclick={() => fileInput?.click()} disabled={isParsing}>Browse files</button></div>
       {/if}
-    </div>
+    </main>
+    {#if inspectorOpen}
+      <aside class="context-inspector-panel" id="context-inspector" aria-label="Document inspector">
+        {#if selectedDocument}
+          <div class="document-title-row"><div><p class="eyebrow">DOCUMENT INSPECTOR</p><h3>{selectedName}</h3></div><button class="secondary-button" onclick={exportContextPdf} disabled={!pages.length}>Export PDF</button><span class="document-stat">{pages.length} pages · {chunks.length} chunks · {indexedCount} indexed</span></div>
+          <details class="document-ask-panel" open>
+            <summary><span>✦ Ask this document</span><small>{indexedCount ? `${indexedCount} chunks indexed` : "Index chunks to enable grounded questions"}</small></summary>
+            <div class="document-ask-body">
+              <div class="document-ask-controls"><label for="document-model">MODEL</label><select id="document-model" bind:value={selectedModel} disabled={chatModels.length === 0 || isAsking}>{#each chatModels as model}<option value={model.name}>{model.name}</option>{/each}</select><label for="document-context-depth">CONTEXT</label><select id="document-context-depth" bind:value={contextDepth} disabled={isAsking}><option value="light">Light · 2 short passages</option><option value="standard">Standard · up to 5 passages</option></select><button class="memory-index-button" onclick={buildDocumentIndex} disabled={isIndexing || !connected || chunks.length === 0}>{isIndexing ? "Embedding chunks…" : indexedCount ? "Re-index" : "Index chunks"}</button></div>
+              <form class="document-question-form" onsubmit={(event) => { event.preventDefault(); void askDocument(); }}><textarea bind:value={query} onkeydown={handleQuestionKeydown} rows="2" placeholder="Ask a question about this document…" disabled={!connected || isAsking}></textarea><button class="send-button" type="submit" disabled={!query.trim() || !connected || isAsking || indexedCount === 0 || !selectedModel}>{isAsking ? "Searching…" : "Ask ↗"}</button></form>
+              {#if indexedCount === 0}<p class="document-index-hint">Click <strong>Index chunks</strong> if automatic indexing was unavailable.</p>{/if}
+              {#if answer}<div class="document-answer"><div class="preview-heading"><div><p class="eyebrow">GROUNDED RESPONSE</p><h4>{selectedModel}</h4></div></div><MarkdownContent source={answer} /></div>{:else if isAsking}<div class="document-answer-loading"><span class="spin">⟳</span> Retrieving passages and generating an answer…</div>{/if}
+              {#if sources.length}<div class="document-sources"><span class="eyebrow">RETRIEVED SOURCES</span>{#each sources as source, index}<button onclick={() => (selectedPageNumber = source.pageNumber)} title="Open this source page"><strong>Source {index + 1} · page {source.pageNumber}</strong><span>{pageScopeUsed ? "requested page" : `${Math.round(source.score * 100)}% match`}</span><p>{source.text}</p></button>{/each}</div>{/if}
+            </div>
+          </details>
+        {:else}<div class="context-empty-state"><strong>Select a document to inspect</strong><p>Choose a file from the source library to see its details and ask grounded questions.</p></div>{/if}
+      </aside>
+    {/if}
   </div>
   <div class="chat-footnote"><span class="privacy-dot"></span><span>Text extraction, embeddings, and similarity search run locally through the app and Ollama. Only retrieved excerpt text is passed to the selected local chat model.</span></div>
 </section>

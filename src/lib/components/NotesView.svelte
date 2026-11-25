@@ -2,17 +2,21 @@
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import MarkdownContent from "./MarkdownContent.svelte";
-  import { cancelChatGeneration, createChatSession, getDocumentIndexCount, indexDocumentChunks, listChatSessions, listDocuments, loadChatSession, loadDocument, saveChatSession, searchDocumentChunks, streamOllamaChat } from "../services/ollama";
+  import { cancelChatGeneration, createChatSession, deleteChatSession, deleteDocument, getDocumentIndexCount, indexDocumentChunks, listChatSessions, listDocuments, loadChatSession, loadDocument, saveChatSession, searchDocumentChunks, streamOllamaChat } from "../services/ollama";
   import type { ChatMessage, ChatSession, DocumentChunkInput, DocumentMetadata, DocumentSearchHit } from "../types/chat";
   import type { OllamaModel } from "../types/ollama";
 
   type StreamPayload = { requestId: string; content: string; done: boolean; promptEvalCount?: number; evalCount?: number };
   type DirectoryEntry = { name: string; kind: "file" | "directory"; getFile?: () => Promise<File>; values?: () => AsyncIterable<DirectoryEntry> };
   type PickerWindow = Window & { showDirectoryPicker?: () => Promise<DirectoryEntry> };
+  type Notebook = { id: string; name: string; folderPath: string };
 
   let { models, baseUrl, connected }: { models: OllamaModel[]; baseUrl: string; connected: boolean } = $props();
   let documents = $state<(DocumentMetadata & { indexedCount: number })[]>([]);
   let sessions = $state<ChatSession[]>([]);
+  let notebooks = $state<Notebook[]>([]);
+  let activeNotebookId = $state("");
+  let historySidebarOpen = $state(true);
   let folderName = $state("");
   let selectedIds = $state<string[]>([]);
   let selectedModel = $state("");
@@ -33,15 +37,32 @@
   let noteDropDepth = 0;
   let folderInput = $state<HTMLInputElement>();
   let fileInput = $state<HTMLInputElement>();
+  let notesAttachMenu = $state<HTMLDetailsElement>();
 
   const chatModels = $derived(models.filter((model) => !/embed|embedding/i.test(model.name)));
+  const selectedModelHasVision = $derived(/vision|qwen\d.*-vl|llava|moondream|bakllava/i.test(selectedModel));
   const folderDocuments = $derived(documents.filter((document) =>
     Boolean(folderName) && (document.folderPath === folderName || document.folderPath?.startsWith(folderName + "/")),
   ));
+  const activeNotebook = $derived(notebooks.find((notebook) => notebook.id === activeNotebookId));
+
+  function sourceFileIcon(name: string) {
+    const extension = name.toLowerCase().split(".").pop();
+    if (extension === "pdf") return "PDF";
+    if (extension === "docx" || extension === "rtf") return "DOC";
+    if (["png", "jpg", "jpeg", "webp"].includes(extension ?? "")) return "IMG";
+    return "TXT";
+  }
 
   onMount(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
+    const closeAttachmentMenu = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      if (notesAttachMenu && !notesAttachMenu.contains(target)) notesAttachMenu.open = false;
+    };
+    document.addEventListener("pointerdown", closeAttachmentMenu);
     const refresh = () => { void refreshLibrary(); };
     window.addEventListener("contextcraft:documents-updated", refresh);
     void listen<StreamPayload>("chat-stream", (event) => {
@@ -60,6 +81,7 @@
     return () => {
       disposed = true;
       unlisten?.();
+      document.removeEventListener("pointerdown", closeAttachmentMenu);
       window.removeEventListener("contextcraft:documents-updated", refresh);
     };
   });
@@ -72,6 +94,13 @@
     try {
       const saved = await listDocuments();
       documents = await Promise.all(saved.map(async (document) => ({ ...document, indexedCount: await getDocumentIndexCount(document.id).catch(() => 0) })));
+      const stored: Notebook[] = (() => { try { return JSON.parse(localStorage.getItem("contextcraft-notebooks") ?? "[]") as Notebook[]; } catch { return []; } })();
+      const folders = new Map<string, Notebook>();
+      for (const document of documents) {
+        const path = document.folderPath?.split("/")[0]?.trim();
+        if (path) folders.set(path, { id: `folder:${path}`, name: path, folderPath: path });
+      }
+      notebooks = [...folders.values(), ...stored.filter((notebook) => !folders.has(notebook.folderPath))];
       if (folderName) selectedIds = documents.filter((document) => document.folderPath === folderName || document.folderPath?.startsWith(folderName + "/")).map((document) => document.id);
     } catch (error) { errorMessage = error instanceof Error ? error.message : String(error); }
   }
@@ -90,6 +119,10 @@
       folderName = directory.name;
       const files: File[] = [];
       await collectFiles(directory, files);
+      if (files.some((file) => /^image\/(png|jpeg|webp)$/i.test(file.type) || /\.(png|jpe?g|webp)$/i.test(file.name)) && !selectedModelHasVision) {
+        errorMessage = "Select an Ollama vision model such as qwen3-vl before adding images.";
+        return;
+      }
       selectedIds = [];
       if (!files.length) {
         statusMessage = "“" + folderName + "” is empty. Add files and choose it again when ready.";
@@ -115,6 +148,11 @@
     const input = event.currentTarget as HTMLInputElement;
     const files = Array.from(input.files ?? []);
     folderName = (files[0]?.webkitRelativePath ?? "").split("/")[0] ?? "";
+    if (files.some((file) => /^image\/(png|jpeg|webp)$/i.test(file.type) || /\.(png|jpe?g|webp)$/i.test(file.name)) && !selectedModelHasVision) {
+      input.value = "";
+      errorMessage = "Select an Ollama vision model such as qwen3-vl before adding images.";
+      return;
+    }
     if (!files.length) {
       errorMessage = "This browser could not read that folder. Use its folder picker or choose a folder containing files.";
       return;
@@ -126,9 +164,11 @@
   async function importSelectedFiles(event: Event) {
     const input = event.currentTarget as HTMLInputElement;
     const files = Array.from(input.files ?? []);
-    if (!files.length) return;
-    await importFolder(files, folderName || "Added files");
     input.value = "";
+    if (!files.length) return;
+    const containsImage = files.some((file) => /^image\/(png|jpeg|webp)$/i.test(file.type) || /\.(png|jpe?g|webp)$/i.test(file.name));
+    if (containsImage && !selectedModelHasVision) { errorMessage = "Select an Ollama vision model such as qwen3-vl before adding images."; return; }
+    await importFolder(files, folderName || "Added files");
   }
 
   function onNotesDragEnter(event: DragEvent) {
@@ -159,6 +199,8 @@
     event.stopPropagation();
     noteDropDepth = 0;
     isDropActive = false;
+    const containsImage = files.some((file) => /^image\/(png|jpeg|webp)$/i.test(file.type) || /\.(png|jpe?g|webp)$/i.test(file.name));
+    if (containsImage && !selectedModelHasVision) { errorMessage = "Select an Ollama vision model such as qwen3-vl before dropping images."; return; }
     void importFolder(files, folderName || "Dropped files");
   }
 
@@ -179,14 +221,57 @@
         resolve({ attemptedCount: detail.attemptedCount ?? files.length, importedCount: detail.importedCount ?? 0, failures: detail.failures ?? [] });
       };
       window.addEventListener("contextcraft:import-complete", onComplete);
-      window.dispatchEvent(new CustomEvent("contextcraft:import-files", { detail: { files, folderPath: root } }));
+      window.dispatchEvent(new CustomEvent("contextcraft:import-files", { detail: { files, folderPath: root, visionModel: files.some((file) => /\.(png|jpe?g|webp)$/i.test(file.name)) ? selectedModel : undefined } }));
     });
     await refreshLibrary();
     const imported = documents.filter((document) => document.folderPath === root || document.folderPath?.startsWith(root + "/"));
     selectedIds = imported.map((document) => document.id);
     isImporting = false;
+    if (imported.length) {
+      const notebook: Notebook = { id: `folder:${root}`, name: root, folderPath: root };
+      if (!notebooks.some((item) => item.id === notebook.id)) notebooks = [notebook, ...notebooks];
+      activeNotebookId = notebook.id;
+    }
     statusMessage = "Loaded " + result.importedCount + " of " + result.attemptedCount + " file(s) from “" + root + "”. Select the sources for this Notes chat.";
     if (result.failures.length) errorMessage = result.failures.slice(0, 5).join(" · ");
+  }
+
+  async function openNotebook(notebook: Notebook) {
+    activeNotebookId = notebook.id;
+    folderName = notebook.folderPath;
+    selectedIds = documents.filter((document) => document.folderPath === notebook.folderPath || document.folderPath?.startsWith(notebook.folderPath + "/")).map((document) => document.id);
+    messages = [];
+    sources = [];
+    question = "";
+    const existing = sessions.find((session) => session.title.startsWith(`Notes · ${notebook.folderPath} ·`));
+    if (existing) await openNotesChat(existing);
+    else await createNotesChat();
+  }
+
+  function returnToNotebooks() {
+    activeNotebookId = "";
+    folderName = "";
+    activeSessionId = "";
+    sessionTitle = "";
+    messages = [];
+    sources = [];
+    question = "";
+    statusMessage = "";
+    errorMessage = "";
+  }
+
+  async function removeNotebook(notebook: Notebook) {
+    if (!window.confirm(`Delete notebook “${notebook.name}” and its imported files and chats from this device?`)) return;
+    try {
+      const notebookDocs = documents.filter((document) => document.folderPath === notebook.folderPath || document.folderPath?.startsWith(notebook.folderPath + "/"));
+      const notebookSessions = sessions.filter((session) => session.title.startsWith(`Notes · ${notebook.folderPath} ·`));
+      await Promise.all([...notebookDocs.map((document) => deleteDocument(document.id)), ...notebookSessions.map((session) => deleteChatSession(session.id))]);
+      notebooks = notebooks.filter((item) => item.id !== notebook.id);
+      localStorage.setItem("contextcraft-notebooks", JSON.stringify(notebooks));
+      if (activeNotebookId === notebook.id) returnToNotebooks();
+      await Promise.all([refreshLibrary(), refreshHistory()]);
+      statusMessage = `Deleted “${notebook.name}” and its local files.`;
+    } catch (error) { errorMessage = error instanceof Error ? error.message : String(error); }
   }
 
   async function createNotesChat() {
@@ -321,66 +406,77 @@
     isGenerating = false;
     await persistNotesChat().catch((error) => { errorMessage = error instanceof Error ? error.message : String(error); });
   }
+
+  function handleNotesQuestionKeydown(event: KeyboardEvent) {
+    if (event.key === "Enter" && (!event.shiftKey || event.ctrlKey)) {
+      event.preventDefault();
+      (event.currentTarget as HTMLTextAreaElement).form?.requestSubmit();
+    }
+  }
 </script>
 
-<section class="notes-page" ondragenter={onNotesDragEnter} ondragover={onNotesDragOver} ondragleave={onNotesDragLeave} ondrop={onNotesDrop}>
+<div class="notes-page" role="region" aria-label="Notes notebooks" ondragenter={onNotesDragEnter} ondragover={onNotesDragOver} ondragleave={onNotesDragLeave} ondrop={onNotesDrop}>
   {#if isDropActive}<div class="notes-drop-overlay"><span>＋</span><strong>Drop files into this Notes folder</strong><small>Multiple files supported · browse or drop PDF, DOCX, text, and images</small></div>{/if}
-  <div class="notes-heading">
-    <div><p class="eyebrow accent-text">PERSONAL KNOWLEDGE SPACE</p><h2>Notes</h2><p class="muted">Choose a folder, select its files, and ask a local model questions grounded in their contents.</p></div>
-    <div class="notes-folder-actions">
-      <input bind:this={folderInput} class="visually-hidden-file" type="file" webkitdirectory directory multiple onchange={importFolderInput} />
-      <input bind:this={fileInput} class="visually-hidden-file" type="file" multiple accept="application/pdf,.pdf,.docx,.txt,.md,.markdown,.text,.csv,.json,.html,.htm,.xml,.yaml,.yml,.log,.rtf,.png,.jpg,.jpeg,.webp,text/plain,text/markdown" onchange={importSelectedFiles} />
-      <button class="context-import-button" onclick={chooseFolder} disabled={isImporting || isIndexing}>＋ Choose a folder</button>
-      <button class="secondary-button" onclick={() => fileInput?.click()} disabled={isImporting || isIndexing}>＋ Browse files</button>
-      {#if folderName}<button class="secondary-button" onclick={() => folderInput?.click()} disabled={isImporting || isIndexing}>Browse a folder</button>{/if}
-    </div>
-  </div>
+  <input bind:this={folderInput} class="visually-hidden-file" type="file" webkitdirectory directory multiple onchange={importFolderInput} />
+  <input bind:this={fileInput} class="visually-hidden-file" type="file" multiple accept="application/pdf,.pdf,.docx,.txt,.md,.markdown,.text,.csv,.json,.html,.htm,.xml,.yaml,.yml,.log,.rtf,.png,.jpg,.jpeg,.webp,text/plain,text/markdown" onchange={importSelectedFiles} />
   {#if errorMessage}<div class="storage-error" role="alert">{errorMessage}</div>{/if}
   {#if statusMessage}<div class="context-status" role="status"><span class="privacy-dot"></span>{statusMessage}</div>{/if}
-  <div class="notes-layout">
-    <aside class="notes-library glass-card">
-      <div class="document-library-heading"><div><p class="eyebrow">SELECTED FOLDER</p><h3>{folderName || "No folder selected"}</h3></div><span class="history-count">{folderDocuments.length}</span></div>
-      {#if isLoading}<p class="document-empty">Loading local files…</p>
-      {:else if !folderName}<p class="document-empty">Choose a folder. Its extracted text stays in your local library.</p>
-      {:else if !folderDocuments.length}<p class="document-empty">This folder has no imported files yet. Choose “Add folder files” after adding documents.</p>
-      {:else}
-        <div class="notes-document-list">
-          {#each folderDocuments as document (document.id)}
-            <label class="notes-document-option"><input type="checkbox" bind:group={selectedIds} value={document.id} disabled={isGenerating || isIndexing} /><span><strong>{document.name}</strong><small>{document.pageCount} section(s) · {document.indexedCount} chunks indexed</small></span></label>
-          {/each}
-        </div>
-        <button class="memory-index-button" onclick={indexSelectedFiles} disabled={!connected || isIndexing || !selectedIds.length}>{isIndexing ? "Indexing…" : "Index selected files"}</button>
-      {/if}
-      <div class="notes-history">
-        <div class="document-library-heading"><div><p class="eyebrow">NOTES CHATS</p><h3>Recent chats</h3></div><button class="new-chat-button" onclick={createNotesChat} disabled={!folderName || isGenerating}>＋ New</button></div>
-        {#each sessions.slice(0, 12) as session (session.id)}<button class="notes-session" class:active={session.id === activeSessionId} onclick={() => openNotesChat(session)} disabled={isGenerating}>{session.title.replace(/^Notes · /, "")}</button>{/each}
+  {#if !activeNotebook}
+    <div class="notes-library-heading-row"><div><p class="eyebrow accent-text">PERSONAL KNOWLEDGE SPACE</p><h2>Your notebooks</h2><p class="muted">Create a notebook from a folder of PDFs, documents, or images, then chat with your sources.</p></div><button class="primary-button notes-create-button" onclick={chooseFolder} disabled={isImporting}><span>＋</span> New notebook</button></div>
+    {#if isLoading}<div class="notes-notebook-empty">Loading your local notebooks…</div>
+    {:else if notebooks.length}
+      <div class="notes-notebook-grid">
+        {#each notebooks as notebook (notebook.id)}
+          {@const notebookFiles = documents.filter((document) => document.folderPath === notebook.folderPath || document.folderPath?.startsWith(notebook.folderPath + "/"))}
+          <article class="notes-notebook-card glass-card"><button class="notes-notebook-open" onclick={() => void openNotebook(notebook)}><span class="notes-notebook-icon">▤</span><strong>{notebook.name}</strong><small>{notebookFiles.length} sources · local notebook</small></button><button class="notes-notebook-delete" onclick={() => void removeNotebook(notebook)} aria-label={`Delete ${notebook.name}`} title="Delete notebook">×</button></article>
+        {/each}
       </div>
-    </aside>
-    <div class="notes-chat glass-card">
-      <div class="notes-chat-controls">
-        <label>LOCAL MODEL<select bind:value={selectedModel} disabled={isGenerating || !chatModels.length}>{#each chatModels as model}<option value={model.name}>{model.name}</option>{/each}</select></label>
-        <label>CONTEXT<select bind:value={contextDepth} disabled={isGenerating}><option value="light">Light · compact passages</option><option value="standard">Standard · more passages</option></select></label>
-        <button class="secondary-button" onclick={createNotesChat} disabled={!folderName || isGenerating}>New notes chat</button>
+    {:else}
+      <div class="notes-notebook-empty"><span class="empty-icon">▤</span><strong>Your notes start here</strong><p>Create a notebook from a folder. PDFs, DOCX files, and images stay on this device and become searchable sources.</p><button class="primary-button" onclick={chooseFolder} disabled={isImporting}>＋ Choose a folder</button></div>
+    {/if}
+  {:else}
+    <header class="notes-workspace-heading"><button class="notes-back-button" onclick={returnToNotebooks}>← All notebooks</button><div class="notes-workspace-title"><span class="notes-notebook-icon">▤</span><div><h2>{activeNotebook.name}</h2><small>{folderDocuments.length} sources · saved on this device</small></div></div><div class="notes-workspace-actions"><button class="notes-history-toggle" class:active={historySidebarOpen} onclick={() => (historySidebarOpen = !historySidebarOpen)} aria-expanded={historySidebarOpen} aria-controls="notes-chat-history">{historySidebarOpen ? "Hide history" : "Show history"}</button><button class="primary-button" onclick={createNotesChat} disabled={isGenerating || isImporting}><span>＋</span> New chat</button><button class="notes-notebook-delete toolbar-delete" onclick={() => void removeNotebook(activeNotebook)} aria-label="Delete notebook" title="Delete notebook">×</button></div></header>
+    <div class="notes-layout notebook-layout" class:history-collapsed={!historySidebarOpen}>
+      <aside class="notes-library glass-card">
+        <div class="document-library-heading"><div><p class="eyebrow">SOURCES</p><h3>{activeNotebook.name}</h3></div><span class="history-count">{folderDocuments.length}</span></div>
+        {#if folderDocuments.length}
+          <div class="notes-document-list">
+            {#each folderDocuments as document (document.id)}
+              <label class="notes-document-option"><input type="checkbox" bind:group={selectedIds} value={document.id} disabled={isGenerating || isIndexing} /><span class="notes-file-icon">{sourceFileIcon(document.name)}</span><span class="notes-file-copy"><strong>{document.name}</strong><small>{document.pageCount} pages · {document.indexedCount ? `${document.indexedCount} chunks` : "not indexed"}</small></span></label>
+            {/each}
+          </div>
+          <button class="memory-index-button" onclick={indexSelectedFiles} disabled={!connected || isIndexing || !selectedIds.length}>{isIndexing ? "Indexing…" : "Index selected sources"}</button>
+        {:else}<p class="document-empty">Add PDFs, documents, or images to start chatting.</p>{/if}
+      </aside>
+      <div class="notes-chat glass-card">
+        <div class="notes-chat-controls"><label>MODEL<select bind:value={selectedModel} disabled={isGenerating || !chatModels.length}>{#each chatModels as model}<option value={model.name}>{model.name}</option>{/each}</select></label><label>CONTEXT<select bind:value={contextDepth} disabled={isGenerating}><option value="light">Light · compact sources</option><option value="standard">Standard · more sources</option></select></label><span class="notes-model-note">Images use an installed Ollama vision model during import.</span></div>
+        {#if !connected}<div class="chat-notice warning"><span>!</span><div><strong>Ollama is not connected</strong><p>Connect Ollama to ask questions in this notebook.</p></div></div>
+        {:else}
+          <div class="notes-message-list">
+            {#if messages.length === 0}<div class="context-empty-state"><span class="empty-icon">✦</span><strong>Ask your notebook</strong><p>Select sources on the left. Answers include file names and page references.</p></div>{/if}
+            {#each messages as message (message.id)}<article class="notes-message" class:user-message={message.role === "user"}><span class="message-author">{message.role === "user" ? "You" : message.model ?? selectedModel}</span>{#if message.role === "assistant"}{#if message.content}<MarkdownContent source={message.content} />{:else}<div class="typing-indicator"><i></i><i></i><i></i></div>{/if}{:else}<div class="user-message-text">{message.content}</div>{/if}</article>{/each}
+            {#if sources.length}<div class="notes-source-list"><p class="eyebrow">SOURCES USED</p>{#each sources as source}<article><strong>{source.documentName} · page {source.pageNumber}</strong><p>{source.text}</p></article>{/each}</div>{/if}
+          </div>
+          <form class="notes-composer notebook-composer" class:drag-over={isDropActive} ondragenter={onNotesDragEnter} ondragover={onNotesDragOver} ondragleave={onNotesDragLeave} ondrop={onNotesDrop} onsubmit={(event) => { event.preventDefault(); void askNotes(); }}>
+            <details class="composer-attach-menu" bind:this={notesAttachMenu}><summary aria-label="Add files" title="Add files">＋</summary><div><button type="button" onclick={() => { if (notesAttachMenu) notesAttachMenu.open = false; fileInput?.click(); }}>Add files</button></div></details>
+            <textarea bind:value={question} onkeydown={handleNotesQuestionKeydown} rows="2" placeholder={selectedIds.length ? "Ask a question about your sources…" : "Select one or more sources first…"} disabled={isGenerating || !selectedIds.length}></textarea>
+            <div><span>Enter / Ctrl+Enter to send · Shift+Enter for a new line · drop files to add them</span>{#if isGenerating}<button class="stop-button" type="button" onclick={stopNotesResponse}>■ Stop</button>{/if}<button class="send-button" type="submit" disabled={!question.trim() || !selectedIds.length || !connected || isGenerating}>{isGenerating ? "Generating…" : "Send ↗"}</button></div>
+          </form>
+        {/if}
       </div>
-      {#if !connected}<div class="chat-notice warning"><span>!</span><div><strong>Ollama is not connected</strong><p>Connect Ollama to ask questions in Notes.</p></div></div>
-      {:else if !folderName}<div class="context-empty-state"><span class="empty-icon">▤</span><strong>Choose your Notes folder</strong><p>Pick a folder, then select one or more files to use in this chat.</p></div>
-      {:else}
-        <div class="notes-message-list">
-          {#if messages.length === 0}<div class="context-empty-state"><span class="empty-icon">✦</span><strong>Ask your selected notes</strong><p>Choose files in the left panel. Answers cite filenames and page numbers.</p></div>{/if}
-          {#each messages as message (message.id)}
-            <article class="notes-message" class:user-message={message.role === "user"}><span class="message-author">{message.role === "user" ? "You" : message.model ?? selectedModel}</span>
-              {#if message.role === "assistant"}{#if message.content}<MarkdownContent source={message.content} />{:else}<div class="typing-indicator"><i></i><i></i><i></i></div>{/if}
-              {:else}<div class="user-message-text">{message.content}</div>{/if}
-            </article>
-          {/each}
-          {#if sources.length}<div class="notes-source-list"><p class="eyebrow">RETRIEVED SOURCES</p>{#each sources as source}<article><strong>{source.documentName} · page {source.pageNumber}</strong><p>{source.text}</p></article>{/each}</div>{/if}
-        </div>
-        <form class="notes-composer" onsubmit={(event) => { event.preventDefault(); void askNotes(); }}>
-          <textarea bind:value={question} rows="2" placeholder={selectedIds.length ? "Ask a question about the selected notes…" : "Select one or more files first…"} disabled={isGenerating || !selectedIds.length}></textarea>
-          <div><span>Uses retrieved excerpts from selected files</span>{#if isGenerating}<button class="stop-button" type="button" onclick={stopNotesResponse}>■ Stop</button>{/if}<button class="send-button" type="submit" disabled={!question.trim() || !selectedIds.length || !connected || isGenerating}>{isGenerating ? "Generating…" : "Ask notes ↗"}</button></div>
-        </form>
+      {#if historySidebarOpen}
+        <aside class="notes-chat-history glass-card" id="notes-chat-history" aria-label="Notebook chat history">
+          <div class="notes-chat-history-heading"><div><p class="eyebrow">NOTEBOOK HISTORY</p><h3>Chats</h3></div><span class="history-count">{sessions.filter((session) => session.title.startsWith(`Notes · ${activeNotebook.folderPath} ·`)).length}</span></div>
+          <button class="notes-history-new" onclick={createNotesChat} disabled={isGenerating}>＋ New chat</button>
+          <div class="notes-chat-history-list">
+            {#each sessions.filter((session) => session.title.startsWith(`Notes · ${activeNotebook.folderPath} ·`)) as session (session.id)}
+              <button class="notes-session" class:active={session.id === activeSessionId} onclick={() => openNotesChat(session)} disabled={isGenerating}><strong>{session.title.split(" · ").slice(2).join(" · ") || "New chat"}</strong><small>{session.updatedAt ? new Date(session.updatedAt).toLocaleString() : "Saved on this device"}</small></button>
+            {/each}
+            {#if !sessions.some((session) => session.title.startsWith(`Notes · ${activeNotebook.folderPath} ·`))}<p class="notes-history-empty">Your notebook chats will appear here.</p>{/if}
+          </div>
+        </aside>
       {/if}
     </div>
-  </div>
-  <div class="chat-footnote"><span class="privacy-dot"></span><span>Notes chats and extracted documents are saved locally. Retrieved text is sent to your selected local Ollama model.</span></div>
-</section>
+    <div class="chat-footnote"><span class="privacy-dot"></span><span>Notebook sources are indexed on this device. Images are read with an installed Ollama vision model; chat answers use the selected local Ollama model.</span></div>
+  {/if}
+</div>
